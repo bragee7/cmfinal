@@ -36,25 +36,27 @@ class SherpaModelPaths {
 /// models) and the phone fetches ~120 MB once.
 ///
 /// Bundles (verified file layouts, Sept 2026):
-/// - KWS: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01-mobile
+/// - KWS: sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 (full fp32;
+///   the -mobile int8 variant hard-crashes the process with SIGABRT in
+///   Reshape /downsample/Reshape_1 during streaming decode on-device)
 /// - STT: sherpa-onnx-moonshine-tiny-en-int8
 class SherpaModelManager {
   static const kwsUrl =
       'https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/'
-      'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01-mobile.tar.bz2';
+      'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2';
   static const sttUrl =
       'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/'
       'sherpa-onnx-moonshine-tiny-en-int8.tar.bz2';
 
   static const _kwsTopDir =
-      'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01-mobile';
+      'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01';
   static const _sttTopDir = 'sherpa-onnx-moonshine-tiny-en-int8';
 
   /// Exact filenames inside the KWS tarball (verified from the release).
   static const _kwsFiles = <String>[
-    'encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+    'encoder-epoch-12-avg-2-chunk-16-left-64.onnx',
     'decoder-epoch-12-avg-2-chunk-16-left-64.onnx',
-    'joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+    'joiner-epoch-12-avg-2-chunk-16-left-64.onnx',
     'tokens.txt',
   ];
 
