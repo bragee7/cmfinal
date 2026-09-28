@@ -13,7 +13,8 @@ port of the React web app, including the 24/7 background voice listener.
 - Media preview after recording
 
 ### Voice Protection (24/7)
-- Offline keyword detection using Vosk (`vosk-model-small-en-us-0.15`)
+- Two-stage offline detection with sherpa-onnx: Zipformer KWS spots the
+  trigger phrase, Moonshine tiny-en confirms the transcript before firing
 - Runs in a foreground service (`flutter_background_service`) with a persistent
   notification, using the `microphone` foreground type
 - **Auto-starts on login** for user accounts (requests `RECORD_AUDIO` +
@@ -21,8 +22,8 @@ port of the React web app, including the 24/7 background voice listener.
 - Keywords: "help me", "emergency", "save me"
 - On keyword detection while the app is backgrounded, a full-screen intent
   notification brings the app to the foreground to trigger the SOS flow
-- Model zip is bundled in `assets/vosk/model.zip` (~41 MB) and extracted once on
-  first use to the app documents directory (`app_flutter/vosk/`)
+- Models download on first run (~120 MB: KWS + Moonshine STT) into the app
+  support directory (`sherpa_models/`), so the APK stays small
 - The dashboard switch reflects the real foreground-service status and surfaces
   startup errors (e.g. missing `RECORD_AUDIO` permission)
 
@@ -89,13 +90,12 @@ lib/
     api_client.dart               HTTP client (dio)
     sos_service.dart              SOS case API calls
     location_service.dart         GPS location + maps link
-    model_extractor.dart          Vosk model zip extraction (archive)
-    voice_guard_service.dart      Foreground service + Vosk recognizer
+    sherpa_model_manager.dart     Sherpa model download + extract (archive)
+    voice_guard_service.dart      Foreground service + Sherpa KWS→STT engine
   state/
     auth_provider.dart            JWT auth state
     sos_controller.dart           SOS flow state machine
     contacts_provider.dart        Emergency contacts state
-assets/vosk/model.zip             Vosk small English model
 ```
 
 ## Known limitations

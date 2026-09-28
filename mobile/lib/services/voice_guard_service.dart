@@ -1,16 +1,17 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:developer' as developer;
+import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:vosk_flutter_service/vosk_flutter_service.dart';
+import 'package:sherpa_onnx/sherpa_onnx.dart';
 
-import 'model_extractor.dart';
+import 'sherpa_model_manager.dart';
 
 class VoiceGuardService {
   static const _detectionEvent = 'keyword_detected';
@@ -309,107 +310,222 @@ Future<void> _onStart(ServiceInstance service) async {
   // is gone and we correctly keep appInForeground = false.
   service.invoke(VoiceGuardService._serviceReadyEvent);
 
-  String? modelPath;
-  VoskFlutterPlugin? vosk;
-  SpeechService? speechService;
+  // ── Sherpa-ONNX two-stage engine (replaces Vosk) ──
+  // Stage 1 (always-on): Zipformer KWS spots the trigger phrase from the
+  // mic stream. Stage 2 (confirm): Moonshine offline STT transcribes the
+  // last ~5 s of a ring buffer; only a transcript that still contains the
+  // phrase fires — same dedupe + pending-trigger + full-screen alarm path.
+  // Models download on first run (APK stays small); everything lives in
+  // this BG isolate.
+  KeywordSpotter? spotter;
+  OnlineStream? kwsStream;
+  OfflineRecognizer? stt;
+  AudioRecorder? recorder;
+  StreamSubscription<List<int>>? pcmSub;
+  // 8 s ring buffer @16 kHz mono — feeds the Moonshine confirm step.
+  final Float32List ring = Float32List(8 * 16000);
+  int ringPos = 0;
+  int ringCount = 0;
+  bool confirming = false;
 
   try {
-    modelPath = await ModelExtractor.ensureModel();
-    debugPrint('VoiceGuard model path: $modelPath');
-    vosk = VoskFlutterPlugin.instance();
-    final model = await vosk.createModel(modelPath);
-    debugPrint('VoiceGuard Vosk model created');
-    final recognizer = await vosk.createRecognizer(
-      model: model,
-      sampleRate: 16000,
-    );
-    debugPrint('VoiceGuard recognizer created');
-    speechService = await vosk.initSpeechService(recognizer);
-    debugPrint('VoiceGuard speech service initialized');
-
-    String? extractText(String raw) {
-      try {
-        final decoded = jsonDecode(raw);
-        if (decoded is Map<String, dynamic>) {
-          final text = decoded['text'] ?? decoded['partial'];
-          if (text is String) return text.toLowerCase().trim();
-        }
-      } catch (_) {}
-      return null;
+    initBindings();
+    late final SherpaModelPaths paths;
+    try {
+      paths = await SherpaModelManager.ensureModels(
+        onProgress: (stage, done, total) {
+          debugPrint(
+            '[VoiceGuard] model $stage '
+            '${(done / 1024 / 1024).toStringAsFixed(1)} / '
+            '${(total / 1024 / 1024).toStringAsFixed(1)} MB',
+          );
+        },
+      );
+    } catch (e) {
+      debugPrint('[VoiceGuard] model download failed: $e');
+      service.invoke(
+        VoiceGuardService._errorEvent,
+        {'error': 'Voice model unavailable: $e'},
+      );
+      return;
     }
+    debugPrint('VoiceGuard Sherpa models ready');
+
+    spotter = KeywordSpotter(
+      KeywordSpotterConfig(
+        model: OnlineModelConfig(
+          transducer: OnlineTransducerModelConfig(
+            encoder: paths.kwsEncoder,
+            decoder: paths.kwsDecoder,
+            joiner: paths.kwsJoiner,
+          ),
+          tokens: paths.kwsTokens,
+          numThreads: 2,
+        ),
+        // BPE-tokenized with the bundle's bpe.model ("HELP ME" -> 401 70).
+        keywordsBuf: '▁HELP ▁ME',
+      ),
+    );
+    kwsStream = spotter.createStream();
+    debugPrint('VoiceGuard KWS spotter created');
+
+    stt = OfflineRecognizer(
+      OfflineRecognizerConfig(
+        model: OfflineModelConfig(
+          moonshine: OfflineMoonshineModelConfig(
+            preprocessor: paths.sttPreprocessor,
+            encoder: paths.sttEncoder,
+            uncachedDecoder: paths.sttUncachedDecoder,
+            cachedDecoder: paths.sttCachedDecoder,
+          ),
+          tokens: paths.sttTokens,
+          numThreads: 2,
+        ),
+      ),
+    );
+    debugPrint('VoiceGuard Moonshine recognizer created');
 
     String normalize(String text) => text.replaceAll(RegExp(r'\s+'), ' ');
 
-    bool phraseMatches(String text, String keyword, {required bool exact}) {
+    bool phraseMatches(String text, String keyword) {
       final normalized = normalize(text);
-      if (exact) return normalized == keyword;
       final escaped = RegExp.escape(keyword);
       return RegExp(r'(^|\W)' + escaped + r'($|\W)').hasMatch(normalized);
     }
 
-    Future<void> checkTranscript(String raw, {required bool exact}) async {
-      final text = extractText(raw);
-      if (text == null || text.isEmpty) return;
-      for (final keyword in VoiceGuardService.keywords) {
-        if (!phraseMatches(text, keyword, exact: exact)) continue;
-        final now = DateTime.now();
-        final isDuplicate =
-            now.difference(VoiceGuardService._lastTriggeredAt) <
-                VoiceGuardService._dedupeWindow &&
-            VoiceGuardService._lastTriggeredKeyword == keyword;
-        if (isDuplicate) {
-          developer.log(
-            'Keyword "$keyword" already triggered recently, ignoring',
-            name: 'VoiceGuard',
-          );
-          continue;
-        }
-        VoiceGuardService._lastTriggeredAt = now;
-        VoiceGuardService._lastTriggeredKeyword = keyword;
+    Future<void> fireKeyword(String keyword) async {
+      final now = DateTime.now();
+      final isDuplicate =
+          now.difference(VoiceGuardService._lastTriggeredAt) <
+              VoiceGuardService._dedupeWindow &&
+          VoiceGuardService._lastTriggeredKeyword == keyword;
+      if (isDuplicate) {
         developer.log(
-          'Transcript matched: $keyword',
+          'Keyword "$keyword" already triggered recently, ignoring',
           name: 'VoiceGuard',
         );
-        service.invoke(VoiceGuardService._detectionEvent, {'keyword': keyword});
-        if (!appInForeground) {
-          await VoiceGuardService._markPendingTrigger();
-          await VoiceGuardService.showEmergencyNotificationFromBackground(
-            keyword: keyword,
-          );
-        }
-        // Reset the recognizer so the SAME utterance (its trailing final
-        // result) cannot re-fire, and so the NEXT utterance starts clean.
-        try {
-          await speechService?.reset();
-        } catch (_) {}
-        break;
+        return;
+      }
+      VoiceGuardService._lastTriggeredAt = now;
+      VoiceGuardService._lastTriggeredKeyword = keyword;
+      developer.log('Keyword confirmed: $keyword', name: 'VoiceGuard');
+      service.invoke(VoiceGuardService._detectionEvent, {'keyword': keyword});
+      if (!appInForeground) {
+        await VoiceGuardService._markPendingTrigger();
+        await VoiceGuardService.showEmergencyNotificationFromBackground(
+          keyword: keyword,
+        );
       }
     }
 
-    speechService.onPartial().listen((raw) => checkTranscript(raw, exact: true));
-    speechService.onResult().listen((raw) async {
-      await checkTranscript(raw, exact: false);
-      // vosk emits onResult when a full utterance ends. This is the cleanest
-      // "new utterance starts here" signal we get: clear the dedupe so the
-      // NEXT utterance of the keyword triggers again with no limit, without
-      // depending on the cross-isolate reset event.
-      VoiceGuardService._lastTriggeredAt =
-          DateTime.fromMillisecondsSinceEpoch(0);
-      VoiceGuardService._lastTriggeredKeyword = null;
-      // Clear the recognizer so partial text from the finished utterance does
-      // not bleed into the next one (e.g. "help me help me").
+    Future<void> confirmAndFire() async {
+      if (confirming) return;
+      confirming = true;
       try {
-        await speechService?.reset();
-      } catch (_) {}
+        final recognizer = stt;
+        if (recognizer == null) return;
+        final int take = ringCount < 5 * 16000 ? ringCount : 5 * 16000;
+        if (take < 16000) return; // need >= 1 s of audio to confirm
+        final Float32List tail = Float32List(take);
+        int start = (ringPos - take) % ring.length;
+        if (start < 0) start += ring.length;
+        for (int i = 0; i < take; i++) {
+          tail[i] = ring[(start + i) % ring.length];
+        }
+        String transcript = '';
+        try {
+          final OfflineStream s = recognizer.createStream();
+          s.acceptWaveform(samples: tail, sampleRate: 16000);
+          recognizer.decode(s);
+          transcript = recognizer.getResult(s).text;
+          s.free();
+        } catch (e) {
+          debugPrint('[VoiceGuard] moonshine confirm failed: $e');
+        }
+        final String text = transcript.toLowerCase().trim();
+        if (text.isEmpty) {
+          // STT came back empty (or failed): fail OPEN on the KWS hit —
+          // missing a real cry for help is worse than a false alarm, and
+          // the user still gets the 5 s cancel window.
+          debugPrint('[VoiceGuard] KWS hit, STT empty — firing on KWS');
+          await fireKeyword(VoiceGuardService.keywords.first);
+          return;
+        }
+        for (final keyword in VoiceGuardService.keywords) {
+          if (phraseMatches(text, keyword)) {
+            await fireKeyword(keyword);
+            return;
+          }
+        }
+        debugPrint('[VoiceGuard] KWS hit rejected by STT: "$text"');
+      } finally {
+        confirming = false;
+      }
+    }
+
+    final mic = AudioRecorder();
+    recorder = mic;
+    if (!await mic.hasPermission()) {
+      debugPrint('[VoiceGuard] mic permission denied');
+      service.invoke(
+        VoiceGuardService._errorEvent,
+        {'error': 'Microphone permission denied'},
+      );
+      return;
+    }
+    final Stream<List<int>> pcm = await mic.startStream(
+      const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: 16000,
+        numChannels: 1,
+      ),
+    );
+
+    // IMPORTANT: keep the per-chunk path light. The Moonshine confirm +
+    // full-screen alarm + pending-trigger write happen in confirmAndFire /
+    // fireKeyword without stalling the mic loop.
+    pcmSub = pcm.listen((List<int> c) {
+      final Uint8List chunk = c is Uint8List ? c : Uint8List.fromList(c);
+      final int n = chunk.length ~/ 2;
+      final Float32List samples = Float32List(n);
+      for (int i = 0; i < n; i++) {
+        int v = chunk[2 * i] | (chunk[2 * i + 1] << 8);
+        if (v >= 32768) v -= 65536;
+        final double f = v / 32768.0;
+        samples[i] = f;
+        ring[ringPos] = f;
+        ringPos = (ringPos + 1) % ring.length;
+        if (ringCount < ring.length) ringCount++;
+      }
+      final spot = spotter;
+      final stream = kwsStream;
+      if (spot == null || stream == null) return;
+      stream.acceptWaveform(samples: samples, sampleRate: 16000);
+      while (spot.isReady(stream)) {
+        spot.decode(stream);
+      }
+      if (spot.getResult(stream).keyword.isEmpty) return;
+      // Reset so the SAME utterance cannot re-fire while confirming.
+      spot.reset(stream);
+      unawaited(confirmAndFire());
+    }, onError: (Object e) {
+      debugPrint('[VoiceGuard] mic stream error: $e');
     });
 
     service.on('stop').listen((_) async {
-      await speechService?.stop();
+      await pcmSub?.cancel();
+      if (recorder != null) {
+        try {
+          await recorder.stop();
+        } catch (_) {}
+      }
+      kwsStream?.free();
+      spotter?.free();
+      stt?.free();
       service.stopSelf();
     });
 
-    await speechService.start();
-    debugPrint('VoiceGuard speech service started, listening');
+    debugPrint('VoiceGuard Sherpa engine started, listening');
     service.invoke(VoiceGuardService._statusEvent, {'running': true});
   } catch (e, s) {
     developer.log(
