@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:typed_data';
 import 'dart:ui';
@@ -85,6 +86,10 @@ class VoiceGuardService {
   static const _setForegroundEvent = 'set_foreground';
   static const _serviceReadyEvent = 'service_ready';
   static const _pendingTriggerKey = 'zelda_pending_sos_trigger';
+  // Main-isolate mic verdict (reliable — has an Activity). The BG isolate's
+  // record.hasPermission() lies (returns false on MIUI despite OS grant), so
+  // the BG engine trusts this flag instead of its own check.
+  static const _micGrantedMainKey = 'zelda_voice_mic_granted_main';
 
   static bool _appInForeground = true;
 
@@ -210,9 +215,24 @@ class VoiceGuardService {
   }
 
   static Future<void> start() async {
-    await Permission.microphone.request();
+    // Main-isolate verdict (reliable — has an Activity). Stash it for the BG
+    // isolate, whose own record.hasPermission() is untrustworthy (MIUI
+    // returns false there despite the OS grant).
+    final micStatus = await Permission.microphone.request();
     await Permission.notification.request();
     await Permission.ignoreBatteryOptimizations.request();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_micGrantedMainKey, micStatus.isGranted);
+    // Stop-first: if a previous run wedged (older builds registered the
+    // 'stop' listener only after engine success), startService() on the
+    // already-running service would NOT re-invoke _onStart — total silence.
+    try {
+      await Future(() => _service.invoke('stop'))
+          .timeout(const Duration(seconds: 2));
+      await Future.delayed(const Duration(milliseconds: 800));
+    } catch (_) {
+      // No live service to stop — proceed to start fresh.
+    }
     await _service.startService();
   }
 
@@ -286,6 +306,49 @@ Future<void> _onStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
   debugPrint('VoiceGuard BG isolate started');
 
+  // Stage updates on the FGS notification text — observable on-device via
+  // dumpsys even when Flutter logs never reach logcat (seen on Redmi).
+  void note(String stage) {
+    if (service is AndroidServiceInstance) {
+      unawaited(
+        service.setForegroundNotificationInfo(
+          title: 'Voice Protection',
+          content: stage,
+        ),
+      );
+    }
+  }
+
+  note('Starting voice guard…');
+
+  KeywordSpotter? spotter;
+  OnlineStream? kwsStream;
+  OfflineRecognizer? stt;
+  AudioRecorder? recorder;
+  StreamSubscription<List<int>>? pcmSub;
+  // 8 s ring buffer @16 kHz mono — feeds the Moonshine confirm step.
+  final Float32List ring = Float32List(8 * 16000);
+  int ringPos = 0;
+  int ringCount = 0;
+  bool confirming = false;
+
+  // Register the stop handler FIRST — before any fallible engine work.
+  // If KWS/STT/mic setup throws, _onStart returns early via catch; a late
+  // registration would leave a failed service unstoppable (toggle OFF =
+  // no-op, toggle ON = silent no-op on the already-running service).
+  service.on('stop').listen((_) async {
+    await pcmSub?.cancel();
+    if (recorder != null) {
+      try {
+        await recorder.stop();
+      } catch (_) {}
+    }
+    kwsStream?.free();
+    spotter?.free();
+    stt?.free();
+    service.stopSelf();
+  });
+
   var appInForeground = false;
 
   service.on(VoiceGuardService._resetCooldownEvent).listen((_) {
@@ -317,17 +380,6 @@ Future<void> _onStart(ServiceInstance service) async {
   // phrase fires — same dedupe + pending-trigger + full-screen alarm path.
   // Models download on first run (APK stays small); everything lives in
   // this BG isolate.
-  KeywordSpotter? spotter;
-  OnlineStream? kwsStream;
-  OfflineRecognizer? stt;
-  AudioRecorder? recorder;
-  StreamSubscription<List<int>>? pcmSub;
-  // 8 s ring buffer @16 kHz mono — feeds the Moonshine confirm step.
-  final Float32List ring = Float32List(8 * 16000);
-  int ringPos = 0;
-  int ringCount = 0;
-  bool confirming = false;
-
   try {
     initBindings();
     late final SherpaModelPaths paths;
@@ -338,6 +390,11 @@ Future<void> _onStart(ServiceInstance service) async {
             '[VoiceGuard] model $stage '
             '${(done / 1024 / 1024).toStringAsFixed(1)} / '
             '${(total / 1024 / 1024).toStringAsFixed(1)} MB',
+          );
+          note(
+            'Models $stage '
+            '${(done / 1024 / 1024).toStringAsFixed(0)} / '
+            '${(total / 1024 / 1024).toStringAsFixed(0)} MB',
           );
         },
       );
@@ -350,7 +407,9 @@ Future<void> _onStart(ServiceInstance service) async {
       return;
     }
     debugPrint('VoiceGuard Sherpa models ready');
+    note('Models ready, loading KWS…');
 
+    const kwsKeywords = '▁HELP ▁ME';
     spotter = KeywordSpotter(
       KeywordSpotterConfig(
         model: OnlineModelConfig(
@@ -363,11 +422,16 @@ Future<void> _onStart(ServiceInstance service) async {
           numThreads: 2,
         ),
         // BPE-tokenized with the bundle's bpe.model ("HELP ME" -> 401 70).
-        keywordsBuf: '▁HELP ▁ME',
+        // keywordsBufSize MUST be the UTF-8 byte length of keywordsBuf:
+        // native treats a size-0 buffer as zero registered keywords and
+        // refuses to create the spotter ("Failed to create kws").
+        keywordsBuf: kwsKeywords,
+        keywordsBufSize: utf8.encode(kwsKeywords).length,
       ),
     );
     kwsStream = spotter.createStream();
     debugPrint('VoiceGuard KWS spotter created');
+    note('KWS ready, loading STT…');
 
     stt = OfflineRecognizer(
       OfflineRecognizerConfig(
@@ -384,6 +448,7 @@ Future<void> _onStart(ServiceInstance service) async {
       ),
     );
     debugPrint('VoiceGuard Moonshine recognizer created');
+    note('STT ready, opening mic…');
 
     String normalize(String text) => text.replaceAll(RegExp(r'\s+'), ' ');
 
@@ -465,7 +530,15 @@ Future<void> _onStart(ServiceInstance service) async {
 
     final mic = AudioRecorder();
     recorder = mic;
-    if (!await mic.hasPermission()) {
+    // Trust the MAIN-isolate verdict (stashed by start(), reliable — has an
+    // Activity). record.hasPermission() inside this BG isolate lies on MIUI
+    // (returns false despite the OS grant), so it is only a fallback. A real
+    // denial still surfaces as a startStream failure below and maps to the
+    // same permission-denied error.
+    final bgPrefs = await SharedPreferences.getInstance();
+    final mainSideGranted =
+        bgPrefs.getBool(VoiceGuardService._micGrantedMainKey) ?? false;
+    if (!mainSideGranted && !await mic.hasPermission()) {
       debugPrint('[VoiceGuard] mic permission denied');
       service.invoke(
         VoiceGuardService._errorEvent,
@@ -473,13 +546,23 @@ Future<void> _onStart(ServiceInstance service) async {
       );
       return;
     }
-    final Stream<List<int>> pcm = await mic.startStream(
-      const RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: 16000,
-        numChannels: 1,
-      ),
-    );
+    late final Stream<List<int>> pcm;
+    try {
+      pcm = await mic.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+      );
+    } catch (e) {
+      debugPrint('[VoiceGuard] mic startStream failed: $e');
+      service.invoke(
+        VoiceGuardService._errorEvent,
+        {'error': 'Microphone permission denied'},
+      );
+      return;
+    }
 
     // IMPORTANT: keep the per-chunk path light. The Moonshine confirm +
     // full-screen alarm + pending-trigger write happen in confirmAndFire /
@@ -512,20 +595,8 @@ Future<void> _onStart(ServiceInstance service) async {
       debugPrint('[VoiceGuard] mic stream error: $e');
     });
 
-    service.on('stop').listen((_) async {
-      await pcmSub?.cancel();
-      if (recorder != null) {
-        try {
-          await recorder.stop();
-        } catch (_) {}
-      }
-      kwsStream?.free();
-      spotter?.free();
-      stt?.free();
-      service.stopSelf();
-    });
-
     debugPrint('VoiceGuard Sherpa engine started, listening');
+    note('Listening for "help me"');
     service.invoke(VoiceGuardService._statusEvent, {'running': true});
   } catch (e, s) {
     developer.log(
@@ -534,6 +605,7 @@ Future<void> _onStart(ServiceInstance service) async {
       level: 1000,
     );
     debugPrint('VoiceGuard BG service failed: $e\n$s');
+    note('Voice guard error — open app for details');
     service.invoke(VoiceGuardService._errorEvent, {'error': '$e'});
     service.invoke(VoiceGuardService._statusEvent, {'running': false});
     return;
