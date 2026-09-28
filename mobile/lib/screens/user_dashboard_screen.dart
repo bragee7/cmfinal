@@ -184,6 +184,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
     final sos = context.read<SosController>();
     final auth = context.read<AuthProvider>();
     await sos.setVoiceEnabled(false);
+    await sos.setPowerSosEnabled(false);
     await auth.logout();
     if (context.mounted) {
       Navigator.of(context).pushNamedAndRemoveUntil('/login', (route) => false);
@@ -204,6 +205,17 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Voice protection error: $e')),
+      );
+    }
+  }
+
+  Future<void> _togglePowerSos(SosController sos, bool enabled) async {
+    try {
+      await sos.setPowerSosEnabled(enabled);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Power-button SOS error: $e')),
       );
     }
   }
@@ -372,6 +384,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
                         _buildStatusCard(sos),
                         const SizedBox(height: 16),
                         _buildVoiceBanner(sos),
+                        _buildPowerBanner(sos),
                         _buildCameraSelector(sos),
                         if (sos.isTracking) _buildTrackingBanner(sos),
                         const SizedBox(height: 8),
@@ -696,6 +709,44 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
             value: sos.voiceEnabled,
             activeThumbColor: AppColors.green500,
             onChanged: (v) => _toggleVoice(sos, v),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPowerBanner(SosController sos) {
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: AppColors.gray800,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: sos.powerSosEnabled ? AppColors.green500 : AppColors.gray500,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              sos.powerSosEnabled
+                  ? 'Power-button SOS On - Press power 4x in 6s'
+                  : 'Power-button SOS Off',
+              style: const TextStyle(color: AppColors.green400, fontSize: 13),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Switch(
+            value: sos.powerSosEnabled,
+            activeThumbColor: AppColors.green500,
+            onChanged: (v) => _togglePowerSos(sos, v),
           ),
         ],
       ),

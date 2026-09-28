@@ -9,6 +9,7 @@ import '../models/sos_case.dart';
 import '../services/location_service.dart';
 import '../services/sos_service.dart';
 import '../services/voice_guard_service.dart';
+import '../services/power_sos_service.dart';
 
 enum SosStatus {
   idle,
@@ -52,8 +53,10 @@ class SosController extends ChangeNotifier {
   StreamSubscription<String>? _detectionSub;
   StreamSubscription<bool>? _statusSub;
   StreamSubscription<String>? _errorSub;
+  StreamSubscription<void>? _powerSub;
 
   bool _voiceEnabled = false;
+  bool _powerSosEnabled = true;
   bool _initialized = false;
 
   SosStatus get status => _status;
@@ -72,6 +75,7 @@ class SosController extends ChangeNotifier {
   bool get cameraInitialized => _cameraInitialized;
   CameraLensDirection get selectedLens => _selectedLens;
   bool get voiceEnabled => _voiceEnabled;
+  bool get powerSosEnabled => _powerSosEnabled;
 
   bool get isBusy =>
       _status != SosStatus.idle && _status != SosStatus.listening;
@@ -112,6 +116,14 @@ class SosController extends ChangeNotifier {
     }
 
     _voiceEnabled = await VoiceGuardService.isRunning();
+    // 4x power-press: same triggerSOS path => same 5s cancel window.
+    _powerSub = PowerSosService.detections.listen((_) {
+      if (!isBusy) {
+        triggerSOS(triggerKeyword: 'power-button');
+      }
+    });
+    _powerSosEnabled = await PowerSosService.isEnabled();
+    await PowerSosService.initialize();
     notifyListeners();
   }
 
@@ -130,6 +142,12 @@ class SosController extends ChangeNotifier {
     } else {
       await VoiceGuardService.stop();
     }
+  }
+
+  Future<void> setPowerSosEnabled(bool enabled) async {
+    _powerSosEnabled = enabled;
+    notifyListeners();
+    await PowerSosService.setEnabled(enabled);
   }
 
   void playAlertSound() {
@@ -414,6 +432,7 @@ class SosController extends ChangeNotifier {
     _trackingRef?.cancel();
     _watchSub?.cancel();
     _detectionSub?.cancel();
+    _powerSub?.cancel();
     _statusSub?.cancel();
     _errorSub?.cancel();
     _cameraController?.dispose();
