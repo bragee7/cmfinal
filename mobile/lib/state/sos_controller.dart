@@ -116,7 +116,7 @@ class SosController extends ChangeNotifier {
     }
 
     _voiceEnabled = await VoiceGuardService.isRunning();
-    // 4x power-press: same triggerSOS path => same 5s cancel window.
+    // 3x power-press: same triggerSOS path => same 5s cancel window.
     _powerSub = PowerSosService.detections.listen((_) {
       if (!isBusy) {
         triggerSOS(triggerKeyword: 'power-button');

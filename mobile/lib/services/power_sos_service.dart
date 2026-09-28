@@ -3,10 +3,10 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Dart side of the 4x-power-press SOS guard.
+/// Dart side of the 3x-power-press SOS guard.
 ///
 /// Killed-state path is fully native (PowerGuardService + PowerPressReceiver):
-/// on 4x SCREEN_ON/OFF in 6s the receiver writes [pendingKey] into
+/// on 3x SCREEN_ON/OFF in 6s the receiver writes [pendingKey] into
 /// FlutterSharedPreferences and relaunches the app. This class only:
 ///  1. ensures the native guard is running,
 ///  2. consumes a fresh pending trigger into [detections] (same 5s cancel
@@ -32,14 +32,27 @@ class PowerSosService {
   static bool _initialized = false;
 
   /// Start the native guard (idempotent) and fire any fresh pending trigger.
+  ///
+  /// Also registers the live push from MainActivity ("onPowerSosTrigger") so
+  /// a trigger fired while the app is already running reaches SosController
+  /// without waiting for an app restart.
   static Future<void> initialize() async {
     if (_initialized) return;
     _initialized = true;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onPowerSosTrigger') {
+        if (!_detectionController.isClosed) _detectionController.add(null);
+      }
+    });
     try {
       await _channel.invokeMethod('startGuard');
     } catch (_) {
       // Native side missing (tests/iOS) — pending-key path still works.
     }
+    try {
+      // Flush any trigger that arrived before the handler was registered.
+      await _channel.invokeMethod('notifyReady');
+    } catch (_) {}
     await consumePendingTrigger();
   }
 

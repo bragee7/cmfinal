@@ -122,7 +122,7 @@ class PowerGuardService : Service() {
                     "ZELDA Power-button Guard",
                     NotificationManager.IMPORTANCE_LOW,
                 ).apply {
-                    description = "Keeps 4x power-press SOS active even when the app is closed"
+                    description = "Keeps 3x power-press SOS active even when the app is closed"
                 }
             )
         }

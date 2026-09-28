@@ -7,23 +7,25 @@ import android.util.Log
 
 /**
  * Counts SCREEN_ON / SCREEN_OFF in a rolling 6s window.
- * 4+ presses => stash a pending SOS trigger in FlutterSharedPreferences
+ * 3+ presses => stash a pending SOS trigger in FlutterSharedPreferences
  * (same file Dart shared_preferences reads) + wake the app.
  *
  * Each power press generates one SCREEN_OFF + one SCREEN_ON, so we count
- * both events: 2 presses = 4 events, 4 "presses" as the user perceives them
- * (screen toggling) is ~4-8 events. To match "press power button 4 times in
- * 6 seconds" we fire at 4 events in the window.
+ * both events. To match "press power button 3 times in 6 seconds" we fire
+ * at 3 events in the window.
  */
 class PowerPressReceiver : BroadcastReceiver() {
 
     companion object {
         private const val TAG = "PowerPress"
         private const val WINDOW_MS = 6000L
-        private const val REQUIRED_PRESSES = 4
+        private const val REQUIRED_PRESSES = 3
         const val PREFS_NAME = "FlutterSharedPreferences"
-        const val PENDING_KEY = "zelda_power_sos_trigger"
-        const val ENABLED_KEY = "zelda_power_sos_enabled"
+        // Flutter's shared_preferences plugin namespaces every key with the
+        // "flutter." prefix inside this file. Native code MUST use the
+        // prefixed form or Dart reads null (pending trigger never consumed).
+        const val PENDING_KEY = "flutter.zelda_power_sos_trigger"
+        const val ENABLED_KEY = "flutter.zelda_power_sos_enabled"
         private const val ACTION_TRIGGER = "com.zelda.zelda_guardian.POWER_SOS_TRIGGER"
 
         private val pressTimes = ArrayDeque<Long>()
@@ -61,7 +63,7 @@ class PowerPressReceiver : BroadcastReceiver() {
         if (action != Intent.ACTION_SCREEN_ON && action != Intent.ACTION_SCREEN_OFF) return
         try {
             if (recordPress(context)) {
-                Log.i(TAG, "4x power press detected -> triggering SOS")
+                Log.i(TAG, "3x power press detected -> triggering SOS")
                 // Stash pending trigger for Dart to consume on next start.
                 context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                     .edit().putLong(PENDING_KEY, System.currentTimeMillis()).apply()

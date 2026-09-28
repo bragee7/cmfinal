@@ -41,7 +41,7 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        <!-- 4x power-press SOS guard: survives app kill, restarts on boot -->
+        <!-- 3x power-press SOS guard: survives app kill, restarts on boot -->
         <service
             android:name=".PowerGuardService"
             android:exported="false"
@@ -49,7 +49,7 @@
             android:stopWithTask="false">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="4x power-press SOS trigger detection"/>
+                android:value="3x power-press SOS trigger detection"/>
         </service>
         <receiver
             android:name=".BootReceiver"

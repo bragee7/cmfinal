@@ -737,7 +737,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
           Expanded(
             child: Text(
               sos.powerSosEnabled
-                  ? 'Power-button SOS On - Press power 4x in 6s'
+                  ? 'Power-button SOS On - Press power 3x in 6s'
                   : 'Power-button SOS Off',
               style: const TextStyle(color: AppColors.green400, fontSize: 13),
             ),
