@@ -104,7 +104,14 @@ class PowerGuardService : Service() {
             addAction(Intent.ACTION_SCREEN_OFF)
         }
         try {
-            registerReceiver(receiver, filter)
+            // API 33+ throws SecurityException without an explicit exported
+            // flag. System broadcasts must use NOT_EXPORTED.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(receiver, filter)
+            }
             Log.i(TAG, "power receiver registered")
         } catch (e: Exception) {
             Log.w(TAG, "register failed: ${e.message}")
@@ -137,7 +144,7 @@ class PowerGuardService : Service() {
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("ZELDA SOS guard active")
-            .setContentText("Press power 4x in 6s to send SOS")
+            .setContentText("Press power 3x in 6s to send SOS")
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .setContentIntent(launch)
             .setOngoing(true)
@@ -169,7 +176,7 @@ class PowerGuardService : Service() {
         }
         val notif = NotificationCompat.Builder(this, "zelda_voice_protection")
             .setContentTitle("\uD83D\uDEA8 ZELDA SOS TRIGGERED")
-            .setContentText("Power pressed 4x. Opening app to send SOS...")
+            .setContentText("Power pressed 3x. Opening app to send SOS...")
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)

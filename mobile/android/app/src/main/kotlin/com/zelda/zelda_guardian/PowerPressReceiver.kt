@@ -10,9 +10,9 @@ import android.util.Log
  * 3+ presses => stash a pending SOS trigger in FlutterSharedPreferences
  * (same file Dart shared_preferences reads) + wake the app.
  *
- * Each power press generates one SCREEN_OFF + one SCREEN_ON, so we count
- * both events. To match "press power button 3 times in 6 seconds" we fire
- * at 3 events in the window.
+ * Each physical power press yields exactly ONE event (SCREEN_OFF when the
+ * screen was on, SCREEN_ON when it was off), so "press power 3 times in
+ * 6 seconds" == 3 events in the window.
  */
 class PowerPressReceiver : BroadcastReceiver() {
 
