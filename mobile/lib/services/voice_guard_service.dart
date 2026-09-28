@@ -223,22 +223,40 @@ class VoiceGuardService {
     await Permission.ignoreBatteryOptimizations.request();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_micGrantedMainKey, micStatus.isGranted);
-    // Stop-first: if a previous run wedged (older builds registered the
-    // 'stop' listener only after engine success), startService() on the
-    // already-running service would NOT re-invoke _onStart — total silence.
-    try {
-      await Future(() => _service.invoke('stop'))
-          .timeout(const Duration(seconds: 2));
+    // Ordered restart: stop the running service FIRST (awaited, NO timeout)
+    // and only then start fresh. A fire-and-forget stop with a timeout does
+    // NOT cancel the pending invoke — it can deliver AFTER startService()
+    // no-op'd on the already-running service and kill it with no restart
+    // (permanent silent death). Skip entirely when nothing is running.
+    if (await _service.isRunning()) {
+      // invoke() returns void (no completion future), so TRUE ordering comes
+      // from polling: only start fresh after the service actually reports
+      // stopped. Bounded (20 s) so a dead channel can never hang the toggle.
+      try {
+        _service.invoke('stop', {'force': true});
+      } catch (_) {}
+      for (int i = 0; i < 40; i++) {
+        await Future.delayed(const Duration(milliseconds: 500));
+        try {
+          if (!await _service.isRunning()) break;
+        } catch (_) {
+          break;
+        }
+      }
       await Future.delayed(const Duration(milliseconds: 800));
-    } catch (_) {
-      // No live service to stop — proceed to start fresh.
     }
     await _service.startService();
   }
 
   static Future<void> stop() async {
     await setEnabledPref(false);
-    _service.invoke('stop');
+    // Ordered like start(): no fire-and-forget. The pref is already false,
+    // so the BG 'stop' guard lets this through; skip when nothing runs.
+    if (await _service.isRunning()) {
+      try {
+        _service.invoke('stop');
+      } catch (_) {}
+    }
   }
 
   static Future<bool> isRunning() => _service.isRunning();
@@ -336,8 +354,20 @@ Future<void> _onStart(ServiceInstance service) async {
   // If KWS/STT/mic setup throws, _onStart returns early via catch; a late
   // registration would leave a failed service unstoppable (toggle OFF =
   // no-op, toggle ON = silent no-op on the already-running service).
-  service.on('stop').listen((_) async {
-    await pcmSub?.cancel();
+    service.on('stop').listen((event) async {
+      // Guard against STALE stops: start()'s old fire-and-forget stop-first
+      // (and any reordered invoke) must not kill a service the user still
+      // wants. start() passes {'force': true} for a genuine ordered restart;
+      // stop() flips the enabled pref to false BEFORE invoking, so a stop
+      // that arrives while the pref is still true is stale → ignore it.
+      final bool force = event != null && event['force'] == true;
+      if (!force) {
+        final prefs = await SharedPreferences.getInstance();
+        if (prefs.getBool(VoiceGuardService._enabledPrefKey) ?? false) {
+          return; // stale stop → ignore, voice still wanted
+        }
+      }
+      await pcmSub?.cancel();
     if (recorder != null) {
       try {
         await recorder.stop();
@@ -454,7 +484,10 @@ Future<void> _onStart(ServiceInstance service) async {
 
     bool phraseMatches(String text, String keyword) {
       final normalized = normalize(text);
-      final escaped = RegExp.escape(keyword);
+      // Lowercase BOTH sides: keywords list is display-cased ('Help Me')
+      // but the transcript is normalized to lowercase. Without this, every
+      // non-empty STT result was rejected and only empty transcripts fired.
+      final escaped = RegExp.escape(keyword.toLowerCase());
       return RegExp(r'(^|\W)' + escaped + r'($|\W)').hasMatch(normalized);
     }
 
@@ -482,6 +515,9 @@ Future<void> _onStart(ServiceInstance service) async {
         );
       }
     }
+
+    // (Diagnostics note: earlier builds exposed KWS hit counts in the FGS
+    // notification text for on-device debugging; now back to debugPrint only.)
 
     Future<void> confirmAndFire() async {
       if (confirming) return;
@@ -518,6 +554,7 @@ Future<void> _onStart(ServiceInstance service) async {
         }
         for (final keyword in VoiceGuardService.keywords) {
           if (phraseMatches(text, keyword)) {
+            debugPrint('[VoiceGuard] KWS hit confirmed by STT: "$text"');
             await fireKeyword(keyword);
             return;
           }
@@ -589,6 +626,7 @@ Future<void> _onStart(ServiceInstance service) async {
       }
       if (spot.getResult(stream).keyword.isEmpty) return;
       // Reset so the SAME utterance cannot re-fire while confirming.
+      debugPrint('[VoiceGuard] KWS hit, confirming with STT');
       spot.reset(stream);
       unawaited(confirmAndFire());
     }, onError: (Object e) {
