@@ -223,40 +223,21 @@ class VoiceGuardService {
     await Permission.ignoreBatteryOptimizations.request();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_micGrantedMainKey, micStatus.isGranted);
-    // Ordered restart: stop the running service FIRST (awaited, NO timeout)
-    // and only then start fresh. A fire-and-forget stop with a timeout does
-    // NOT cancel the pending invoke — it can deliver AFTER startService()
-    // no-op'd on the already-running service and kill it with no restart
-    // (permanent silent death). Skip entirely when nothing is running.
-    if (await _service.isRunning()) {
-      // invoke() returns void (no completion future), so TRUE ordering comes
-      // from polling: only start fresh after the service actually reports
-      // stopped. Bounded (20 s) so a dead channel can never hang the toggle.
-      try {
-        _service.invoke('stop', {'force': true});
-      } catch (_) {}
-      for (int i = 0; i < 40; i++) {
-        await Future.delayed(const Duration(milliseconds: 500));
-        try {
-          if (!await _service.isRunning()) break;
-        } catch (_) {
-          break;
-        }
-      }
-      await Future.delayed(const Duration(milliseconds: 800));
-    }
+    // startService() on an already-running service is a harmless no-op, so
+    // re-init calls never disturb a healthy engine. A failed service is
+    // revived by toggle OFF (the 'stop' listener below is registered first
+    // thing in _onStart, so it always exists) followed by toggle ON.
     await _service.startService();
   }
 
   static Future<void> stop() async {
     await setEnabledPref(false);
-    // Ordered like start(): no fire-and-forget. The pref is already false,
-    // so the BG 'stop' guard lets this through; skip when nothing runs.
-    if (await _service.isRunning()) {
-      try {
-        _service.invoke('stop');
-      } catch (_) {}
-    }
+    // Unconditional: invoking a non-running service is harmless, and gating
+    // on isRunning() risks skipping a genuine stop. Delivery to a live
+    // service may queue behind engine work, but it is never lost.
+    try {
+      _service.invoke('stop');
+    } catch (_) {}
   }
 
   static Future<bool> isRunning() => _service.isRunning();
@@ -354,19 +335,15 @@ Future<void> _onStart(ServiceInstance service) async {
   // If KWS/STT/mic setup throws, _onStart returns early via catch; a late
   // registration would leave a failed service unstoppable (toggle OFF =
   // no-op, toggle ON = silent no-op on the already-running service).
-    service.on('stop').listen((event) async {
-      // Guard against STALE stops: start()'s old fire-and-forget stop-first
-      // (and any reordered invoke) must not kill a service the user still
-      // wants. start() passes {'force': true} for a genuine ordered restart;
-      // stop() flips the enabled pref to false BEFORE invoking, so a stop
-      // that arrives while the pref is still true is stale → ignore it.
-      final bool force = event != null && event['force'] == true;
-      if (!force) {
-        final prefs = await SharedPreferences.getInstance();
-        if (prefs.getBool(VoiceGuardService._enabledPrefKey) ?? false) {
-          return; // stale stop → ignore, voice still wanted
-        }
-      }
+    service.on('stop').listen((_) async {
+      // Unconditional: the ONLY sender of 'stop' is stop() (genuine user
+      // off), so every stop is honored. No force flags, no pref reads (no
+      // cross-engine staleness), no gates that can skip a genuine stop.
+      // Immediate feedback FIRST: the notification text changes within ~1 s
+      // even if the teardown below is slow, and the mic is released FIRST
+      // so the green dot drops fast. The ORT session frees stay (no memory
+      // leaks), then stopSelf().
+      note('Turning off…');
       await pcmSub?.cancel();
     if (recorder != null) {
       try {
@@ -461,24 +438,35 @@ Future<void> _onStart(ServiceInstance service) async {
     );
     kwsStream = spotter.createStream();
     debugPrint('VoiceGuard KWS spotter created');
-    note('KWS ready, loading STT…');
-
-    stt = OfflineRecognizer(
-      OfflineRecognizerConfig(
-        model: OfflineModelConfig(
-          moonshine: OfflineMoonshineModelConfig(
-            preprocessor: paths.sttPreprocessor,
-            encoder: paths.sttEncoder,
-            uncachedDecoder: paths.sttUncachedDecoder,
-            cachedDecoder: paths.sttCachedDecoder,
+    // STT loads LAZILY in the background AFTER the mic is open: the 100 MB
+    // Moonshine load is what made toggle-ON take 10-15 s. KWS + mic come up
+    // in ~3-5 s; hits while STT is still loading fail OPEN (same policy as
+    // an empty transcript — a missed cry for help is worse than a false
+    // alarm, and the 5 s cancel window still applies).
+    note('KWS ready, opening mic…');
+    unawaited(() async {
+      try {
+        stt = OfflineRecognizer(
+          OfflineRecognizerConfig(
+            model: OfflineModelConfig(
+              moonshine: OfflineMoonshineModelConfig(
+                preprocessor: paths.sttPreprocessor,
+                encoder: paths.sttEncoder,
+                uncachedDecoder: paths.sttUncachedDecoder,
+                cachedDecoder: paths.sttCachedDecoder,
+              ),
+              tokens: paths.sttTokens,
+              numThreads: 2,
+            ),
           ),
-          tokens: paths.sttTokens,
-          numThreads: 2,
-        ),
-      ),
-    );
-    debugPrint('VoiceGuard Moonshine recognizer created');
-    note('STT ready, opening mic…');
+        );
+        debugPrint('VoiceGuard Moonshine recognizer created (lazy)');
+      } catch (e) {
+        // STT stays null → every KWS hit fails open (fires on KWS), exactly
+        // like an empty transcript. Listening is degraded, never dead.
+        debugPrint('VoiceGuard lazy STT load failed, fail-open mode: $e');
+      }
+    }());
 
     String normalize(String text) => text.replaceAll(RegExp(r'\s+'), ' ');
 
@@ -524,7 +512,14 @@ Future<void> _onStart(ServiceInstance service) async {
       confirming = true;
       try {
         final recognizer = stt;
-        if (recognizer == null) return;
+        if (recognizer == null) {
+          // STT still loading (lazy) — fail OPEN on the KWS hit, same as an
+          // empty transcript. This is also what makes "say help me right
+          // after toggle-ON" work while the 100 MB model is still loading.
+          debugPrint('[VoiceGuard] KWS hit, STT not ready — firing on KWS');
+          await fireKeyword(VoiceGuardService.keywords.first);
+          return;
+        }
         final int take = ringCount < 5 * 16000 ? ringCount : 5 * 16000;
         if (take < 16000) return; // need >= 1 s of audio to confirm
         final Float32List tail = Float32List(take);
