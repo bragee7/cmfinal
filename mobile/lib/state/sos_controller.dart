@@ -91,9 +91,9 @@ class SosController extends ChangeNotifier {
     });
 
     _detectionSub = VoiceGuardService.detections.listen((keyword) {
-      if (!isBusy) {
-        triggerSOS(triggerKeyword: keyword);
-      }
+      // Route every detection through triggerSOS — it shows
+      // "SOS already in progress" when busy instead of dropping silently.
+      triggerSOS(triggerKeyword: keyword);
     });
 
     _statusSub = VoiceGuardService.statusStream.listen((running) {
@@ -118,9 +118,8 @@ class SosController extends ChangeNotifier {
     _voiceEnabled = await VoiceGuardService.isRunning();
     // 3x power-press: same triggerSOS path => same 5s cancel window.
     _powerSub = PowerSosService.detections.listen((_) {
-      if (!isBusy) {
-        triggerSOS(triggerKeyword: 'power-button');
-      }
+      // Same triggerSOS path (with busy feedback) as voice detections.
+      triggerSOS(triggerKeyword: 'power-button');
     });
     _powerSosEnabled = await PowerSosService.isEnabled();
     await PowerSosService.initialize();
@@ -161,7 +160,21 @@ class SosController extends ChangeNotifier {
   }
 
   Future<void> triggerSOS({String? triggerKeyword}) async {
-    if (isBusy) return;
+    if (isBusy) {
+      // A trigger (voice / power button / SOS button) arrived while an SOS
+      // is already in flight (cancel window, countdown, recording, sending).
+      // Tell the user instead of silently ignoring it — silent ignores are
+      // perceived as "voice recognition broken" on the second utterance.
+      _success = 'SOS already in progress';
+      notifyListeners();
+      Future.delayed(const Duration(seconds: 3), () {
+        if (_success == 'SOS already in progress') {
+          _success = '';
+          notifyListeners();
+        }
+      });
+      return;
+    }
 
     playAlertSound();
     _status = SosStatus.cancelWindow;
@@ -183,7 +196,22 @@ class SosController extends ChangeNotifier {
     });
   }
 
-  void cancelSOS() {
+  Future<void> cancelSOS() async {
+    // If the camera is mid-recording, stop and release it first — otherwise
+    // the recording leaks (camera/mic held, file never finalized). Gated on
+    // recording status so an idle preview/selector controller is untouched.
+    if (_status == SosStatus.recording && _cameraController != null) {
+      try {
+        if (_cameraController!.value.isRecordingVideo) {
+          await _cameraController!.stopVideoRecording();
+        }
+      } catch (_) {}
+      try {
+        await _cameraController?.dispose();
+      } catch (_) {}
+      _cameraController = null;
+      _cameraInitialized = false;
+    }
     _cancelTimerRef?.cancel();
     _cancelTimerRef = null;
     _cancelTimer = null;
