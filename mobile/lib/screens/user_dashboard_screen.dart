@@ -13,7 +13,6 @@ import '../core/theme.dart';
 import '../core/widgets.dart';
 import '../models/emergency_contact.dart';
 import '../services/voice_guard_service.dart';
-import '../core/api_client.dart';
 import '../state/auth_provider.dart';
 import '../state/contacts_provider.dart';
 import '../state/sos_controller.dart';
@@ -38,9 +37,6 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
   final _emailController = TextEditingController();
   String _relation = '';
   int _priority = 1;
-  List<String> _phrases = [];
-  bool _phrasesLoading = true;
-  final _phraseCtrl = TextEditingController();
 
   static const _relations = ['Parent', 'Spouse', 'Sibling', 'Friend', 'Colleague', 'Other'];
   static const _priorities = [1, 2, 3, 4, 5];
@@ -59,7 +55,6 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
       context.read<SosController>().init();
       context.read<ContactsProvider>().fetchContacts();
       _maybeAutoStartVoice();
-      _loadPhrases();
       VoiceGuardService.consumePendingTrigger();
     });
   }
@@ -79,104 +74,12 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
     }
   }
 
-  Future<void> _loadPhrases() async {
-    try {
-      final res = await ApiClient.instance.get('preferences');
-      final raw = res.data['voicePhrases'] as List?;
-      final phrases = raw?.whereType<String>().map((p) => p.trim()).toList() ?? [];
-      final next = phrases.isEmpty ? const ['help me'] : phrases;
-      if (!mounted) return;
-      setState(() {
-        _phrases = next;
-        _phrasesLoading = false;
-      });
-      VoiceGuardService.setKeywords(next);
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _phrases = const ['help me'];
-        _phrasesLoading = false;
-      });
-      VoiceGuardService.setKeywords(const ['help me']);
-    }
-  }
-
-  Future<void> _savePhrases(List<String> next) async {
-    try {
-      await ApiClient.instance.put('preferences', {'voicePhrases': next});
-      if (!mounted) return;
-      setState(() => _phrases = List.of(next));
-      VoiceGuardService.setKeywords(next);
-    } catch (e) {
-      if (!mounted) return;
-      final s = e.toString();
-      try {
-        final f = await File('/sdcard/Documents/prefs_error.txt').writeAsString(
-          'TIME: ${DateTime.now()}\nERROR: $s\nTYPE: ${e.runtimeType}\n',
-          mode: FileMode.append,
-        );
-        debugPrint('[PREFS] Error written to ${f.path}');
-      } catch (_) {}
-      debugPrint('[PREFS] Save error: $s');
-      String msg;
-      if (s.contains('400')) {
-        msg = 'Invalid phrase. Check length (max 50 chars).';
-      } else if (s.contains('401')) {
-        msg = 'Session expired. Please log in again.';
-      } else if (s.contains('500')) {
-        msg = 'Server error. Try again.';
-      } else if (s.contains('timeout') || s.contains('Timeout')) {
-        msg = 'Server took too long. It may be waking up. Please wait 30s and try again.';
-      } else if (s.contains('connection') || s.contains('Connection')) {
-        msg = 'No internet connection. Check your network.';
-      } else {
-        msg = 'Save failed. Full error saved to Documents/prefs_error.txt';
-      }
-      if (!mounted) return;
-      showDialog(
-        context: context,
-        builder: (_) => AlertDialog(
-          title: const Text('Save Error'),
-          content: SingleChildScrollView(child: Text(s, style: const TextStyle(fontSize: 12))),
-          actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
-        ),
-      );
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(msg), duration: const Duration(seconds: 4)),
-      );
-    }
-  }
-
-  void _addPhrase() {
-    final text = _phraseCtrl.text.trim();
-    if (text.isEmpty) return;
-    if (_phrases.length >= 10) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Maximum 10 phrases allowed.')),
-      );
-      return;
-    }
-    if (_phrases.any((p) => p.toLowerCase() == text.toLowerCase())) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('That phrase already exists.')),
-      );
-      return;
-    }
-    _phraseCtrl.clear();
-    _savePhrases([..._phrases, text]);
-  }
-
-  void _removePhrase(String phrase) {
-    _savePhrases(_phrases.where((p) => p != phrase).toList());
-  }
-
   @override
   void dispose() {
     _glowController.dispose();
     _nameController.dispose();
     _phoneController.dispose();
     _emailController.dispose();
-    _phraseCtrl.dispose();
     super.dispose();
   }
 
@@ -699,7 +602,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
           Expanded(
             child: Text(
               sos.voiceEnabled
-                  ? 'Voice Protection Active - Listening for "Help Me"'
+                  ? 'Voice Protection Active - Listening for loud sounds & whistle'
                   : '24/7 Voice Protection Off',
               style: const TextStyle(color: AppColors.green400, fontSize: 13),
             ),
@@ -1373,7 +1276,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
                 child: _howItWorksStep('1', AppColors.blue600, 'Voice recognition is always active in background'),
               ),
               Expanded(
-                child: _howItWorksStep('2', AppColors.orange600, 'Say "Help Me"'),
+                child: _howItWorksStep('2', AppColors.orange600, 'Whistle or scream loudly'),
               ),
               Expanded(
                 child: _howItWorksStep('3', AppColors.red600, '30-second recording will be sent to police'),
@@ -1396,76 +1299,55 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Text(
-            'Voice Guard Phrases',
+            'Voice Sound Triggers',
             style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600, color: Colors.white),
           ),
           const SizedBox(height: 4),
           const Text(
-            'Phrases that trigger an emergency SOS when spoken aloud.',
+            'Detected on-device with sound analysis (no AI, works offline).',
             style: TextStyle(fontSize: 13, color: Colors.grey),
           ),
           const SizedBox(height: 16),
-          if (_phrasesLoading)
-            const Center(
-              child: Padding(
-                padding: EdgeInsets.all(16),
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-            )
-          else if (_phrases.isEmpty)
-            const Text(
-              'No phrases yet. Add one below.',
-              style: TextStyle(fontSize: 13, color: Colors.grey),
-            )
-          else
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: _phrases
-                  .map(
-                    (p) => InputChip(
-                      label: Text(p),
-                      labelStyle: const TextStyle(color: Colors.white, fontSize: 13),
-                      backgroundColor: AppColors.gray700,
-                      deleteIconColor: AppColors.red600,
-                      onDeleted: () => _removePhrase(p),
-                    ),
-                  )
-                  .toList(),
-            ),
-          const SizedBox(height: 16),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _phraseCtrl,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    hintText: 'e.g. Help Me',
-                    hintStyle: const TextStyle(color: Colors.grey),
-                    filled: true,
-                    fillColor: AppColors.gray700,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(10),
-                      borderSide: BorderSide.none,
-                    ),
-                  ),
-                  onSubmitted: (_) => _addPhrase(),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                onPressed: _addPhrase,
-                icon: const Icon(Icons.add, color: Colors.white),
-                tooltip: 'Add phrase',
-                style: IconButton.styleFrom(
-                  backgroundColor: AppColors.red600,
-                ),
-              ),
-            ],
+          _soundTriggerRow(
+            Icons.campaign,
+            'Whistle',
+            'A deliberate whistle, held about 1 second',
+          ),
+          const SizedBox(height: 8),
+          _soundTriggerRow(
+            Icons.volume_up,
+            'Loud sound',
+            'A sustained scream-level blast',
           ),
         ],
       ),
+    );
+  }
+
+  Widget _soundTriggerRow(IconData icon, String title, String subtitle) {
+    return Row(
+      children: [
+        Icon(icon, color: AppColors.green400, size: 22),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white),
+              ),
+              Text(
+                subtitle,
+                style: const TextStyle(fontSize: 13, color: Colors.grey),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 

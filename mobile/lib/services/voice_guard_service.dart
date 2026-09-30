@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:typed_data';
 import 'dart:ui';
@@ -10,9 +9,8 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:sherpa_onnx/sherpa_onnx.dart';
 
-import 'sherpa_model_manager.dart';
+import 'sound_detector.dart';
 
 class VoiceGuardService {
   static const _detectionEvent = 'keyword_detected';
@@ -22,12 +20,14 @@ class VoiceGuardService {
   static const notificationChannelId = 'zelda_voice_protection';
   static const notificationChannelName = 'ZELDA Voice Protection';
   static const notificationChannelDescription =
-      '24/7 background listening for the emergency phrase';
+      '24/7 background listening for loud distress sounds & whistle';
   static const fgsNotificationId = 256;
   static const alarmNotificationId = 257;
 
-  /// The phrases that trigger an SOS. Configurable at runtime.
-  static List<String> keywords = ['help me'];
+  /// The distress sounds that trigger an SOS: a sustained loud sound
+  /// (scream/shout) and a sustained whistle. No AI models, no downloads —
+  /// detected with pure DSP ([SoundDetector]). Configurable at runtime.
+  static List<String> keywords = ['Loud sound', 'Whistle'];
 
   /// Replace the trigger phrases with a new list (empty lists are rejected).
   static void setKeywords(List<String> list) {
@@ -77,7 +77,7 @@ class VoiceGuardService {
   static String? _lastTriggeredKeyword;
 
   /// Dedupe window: stops the SAME utterance from firing twice (partial result
-  /// then final result of one "help me"). A new utterance after this window, or
+  /// then final result of one trigger sound). A new utterance after this window, or
   /// after a cancel/reset, triggers again with no limit.
   static const _dedupeWindow = Duration(seconds: 2);
 
@@ -101,7 +101,7 @@ class VoiceGuardService {
     _service.invoke(_resetCooldownEvent);
   }
 
-  /// Record that an emergency phrase was detected by the background isolate so
+  /// Record that a trigger sound was detected by the background isolate so
   /// that if the app is woken from the full-screen notification the SOS can be
   /// triggered even if the detection event itself was lost while the main
   /// isolate was dead/paused.
@@ -169,7 +169,7 @@ class VoiceGuardService {
         isForegroundMode: true,
         notificationChannelId: notificationChannelId,
         initialNotificationTitle: 'ZELDA Voice Protection',
-        initialNotificationContent: 'Listening for emergency phrases...',
+        initialNotificationContent: 'Listening for loud sounds & whistle',
         foregroundServiceNotificationId: fgsNotificationId,
         foregroundServiceTypes: [AndroidForegroundType.microphone],
       ),
@@ -251,7 +251,7 @@ class VoiceGuardService {
   }
 
   /// Post a high-priority notification with full-screen intent so the app is
-  /// brought to the foreground when an emergency phrase is detected while the
+  /// brought to the foreground when a trigger sound is detected while the
   /// app is in the background.
   static Future<void> showEmergencyNotification({required String keyword}) async {
     await _ensureNotificationsInitialized();
@@ -320,16 +320,12 @@ Future<void> _onStart(ServiceInstance service) async {
 
   note('Starting voice guard…');
 
-  KeywordSpotter? spotter;
-  OnlineStream? kwsStream;
-  OfflineRecognizer? stt;
+  // Pure-DSP distress detector: no models, no downloads, instant start.
+  // State lives here (fresh per service start); the mic loop below feeds
+  // it PCM floats and fires on a returned label.
+  final detector = SoundDetector();
   AudioRecorder? recorder;
   StreamSubscription<List<int>>? pcmSub;
-  // 8 s ring buffer @16 kHz mono — feeds the Moonshine confirm step.
-  final Float32List ring = Float32List(8 * 16000);
-  int ringPos = 0;
-  int ringCount = 0;
-  bool confirming = false;
 
   // Register the stop handler FIRST — before any fallible engine work.
   // If KWS/STT/mic setup throws, _onStart returns early via catch; a late
@@ -341,8 +337,8 @@ Future<void> _onStart(ServiceInstance service) async {
       // cross-engine staleness), no gates that can skip a genuine stop.
       // Immediate feedback FIRST: the notification text changes within ~1 s
       // even if the teardown below is slow, and the mic is released FIRST
-      // so the green dot drops fast. The ORT session frees stay (no memory
-      // leaks), then stopSelf().
+      // so the green dot drops fast. Then stopSelf(). Nothing to free —
+      // the detector is pure Dart state (no native sessions to close).
       note('Turning off…');
       await pcmSub?.cancel();
     if (recorder != null) {
@@ -350,9 +346,6 @@ Future<void> _onStart(ServiceInstance service) async {
         await recorder.stop();
       } catch (_) {}
     }
-    kwsStream?.free();
-    spotter?.free();
-    stt?.free();
     service.stopSelf();
   });
 
@@ -380,104 +373,20 @@ Future<void> _onStart(ServiceInstance service) async {
   // is gone and we correctly keep appInForeground = false.
   service.invoke(VoiceGuardService._serviceReadyEvent);
 
-  // ── Sherpa-ONNX two-stage engine (replaces Vosk) ──
-  // Stage 1 (always-on): Zipformer KWS spots the trigger phrase from the
-  // mic stream. Stage 2 (confirm): Moonshine offline STT transcribes the
-  // last ~5 s of a ring buffer; only a transcript that still contains the
-  // phrase fires — same dedupe + pending-trigger + full-screen alarm path.
-  // Models download on first run (APK stays small); everything lives in
-  // this BG isolate.
+  // ── Algorithmic distress-sound engine (no AI models) ──
+  // Pure DSP in [SoundDetector]: a sustained loud broadband level
+  // (scream/shout) and a sustained 1.8–2.8 kHz whistle (Goertzel bank),
+  // computed per 50 ms frame straight from the mic stream below.
+  // No downloads, no native sessions: the engine is ready the moment the
+  // mic opens (~1–2 s after toggle-ON), uses ~20 kFLOP/s, and never blocks
+  // the mic loop (detection is synchronous microseconds per chunk; the
+  // only awaits are the fire path, which runs unawaited).
+  // Same downstream path as before: dedupe + pending-trigger +
+  // full-screen alarm in fireKeyword.
   try {
-    initBindings();
-    late final SherpaModelPaths paths;
-    try {
-      paths = await SherpaModelManager.ensureModels(
-        onProgress: (stage, done, total) {
-          debugPrint(
-            '[VoiceGuard] model $stage '
-            '${(done / 1024 / 1024).toStringAsFixed(1)} / '
-            '${(total / 1024 / 1024).toStringAsFixed(1)} MB',
-          );
-          note(
-            'Models $stage '
-            '${(done / 1024 / 1024).toStringAsFixed(0)} / '
-            '${(total / 1024 / 1024).toStringAsFixed(0)} MB',
-          );
-        },
-      );
-    } catch (e) {
-      debugPrint('[VoiceGuard] model download failed: $e');
-      service.invoke(
-        VoiceGuardService._errorEvent,
-        {'error': 'Voice model unavailable: $e'},
-      );
-      return;
-    }
-    debugPrint('VoiceGuard Sherpa models ready');
-    note('Models ready, loading KWS…');
+    debugPrint('VoiceGuard sound engine ready (no models needed)');
 
-    const kwsKeywords = '▁HELP ▁ME';
-    spotter = KeywordSpotter(
-      KeywordSpotterConfig(
-        model: OnlineModelConfig(
-          transducer: OnlineTransducerModelConfig(
-            encoder: paths.kwsEncoder,
-            decoder: paths.kwsDecoder,
-            joiner: paths.kwsJoiner,
-          ),
-          tokens: paths.kwsTokens,
-          numThreads: 2,
-        ),
-        // BPE-tokenized with the bundle's bpe.model ("HELP ME" -> 401 70).
-        // keywordsBufSize MUST be the UTF-8 byte length of keywordsBuf:
-        // native treats a size-0 buffer as zero registered keywords and
-        // refuses to create the spotter ("Failed to create kws").
-        keywordsBuf: kwsKeywords,
-        keywordsBufSize: utf8.encode(kwsKeywords).length,
-      ),
-    );
-    kwsStream = spotter.createStream();
-    debugPrint('VoiceGuard KWS spotter created');
-    // STT loads LAZILY in the background AFTER the mic is open: the 100 MB
-    // Moonshine load is what made toggle-ON take 10-15 s. KWS + mic come up
-    // in ~3-5 s; hits while STT is still loading fail OPEN (same policy as
-    // an empty transcript — a missed cry for help is worse than a false
-    // alarm, and the 5 s cancel window still applies).
-    note('KWS ready, opening mic…');
-    unawaited(() async {
-      try {
-        stt = OfflineRecognizer(
-          OfflineRecognizerConfig(
-            model: OfflineModelConfig(
-              moonshine: OfflineMoonshineModelConfig(
-                preprocessor: paths.sttPreprocessor,
-                encoder: paths.sttEncoder,
-                uncachedDecoder: paths.sttUncachedDecoder,
-                cachedDecoder: paths.sttCachedDecoder,
-              ),
-              tokens: paths.sttTokens,
-              numThreads: 2,
-            ),
-          ),
-        );
-        debugPrint('VoiceGuard Moonshine recognizer created (lazy)');
-      } catch (e) {
-        // STT stays null → every KWS hit fails open (fires on KWS), exactly
-        // like an empty transcript. Listening is degraded, never dead.
-        debugPrint('VoiceGuard lazy STT load failed, fail-open mode: $e');
-      }
-    }());
-
-    String normalize(String text) => text.replaceAll(RegExp(r'\s+'), ' ');
-
-    bool phraseMatches(String text, String keyword) {
-      final normalized = normalize(text);
-      // Lowercase BOTH sides: keywords list is display-cased ('Help Me')
-      // but the transcript is normalized to lowercase. Without this, every
-      // non-empty STT result was rejected and only empty transcripts fired.
-      final escaped = RegExp.escape(keyword.toLowerCase());
-      return RegExp(r'(^|\W)' + escaped + r'($|\W)').hasMatch(normalized);
-    }
+    debugPrint('VoiceGuard sound engine ready (no models needed)');
 
     Future<void> fireKeyword(String keyword) async {
       final now = DateTime.now();
@@ -501,62 +410,6 @@ Future<void> _onStart(ServiceInstance service) async {
         await VoiceGuardService.showEmergencyNotificationFromBackground(
           keyword: keyword,
         );
-      }
-    }
-
-    // (Diagnostics note: earlier builds exposed KWS hit counts in the FGS
-    // notification text for on-device debugging; now back to debugPrint only.)
-
-    Future<void> confirmAndFire() async {
-      if (confirming) return;
-      confirming = true;
-      try {
-        final recognizer = stt;
-        if (recognizer == null) {
-          // STT still loading (lazy) — fail OPEN on the KWS hit, same as an
-          // empty transcript. This is also what makes "say help me right
-          // after toggle-ON" work while the 100 MB model is still loading.
-          debugPrint('[VoiceGuard] KWS hit, STT not ready — firing on KWS');
-          await fireKeyword(VoiceGuardService.keywords.first);
-          return;
-        }
-        final int take = ringCount < 5 * 16000 ? ringCount : 5 * 16000;
-        if (take < 16000) return; // need >= 1 s of audio to confirm
-        final Float32List tail = Float32List(take);
-        int start = (ringPos - take) % ring.length;
-        if (start < 0) start += ring.length;
-        for (int i = 0; i < take; i++) {
-          tail[i] = ring[(start + i) % ring.length];
-        }
-        String transcript = '';
-        try {
-          final OfflineStream s = recognizer.createStream();
-          s.acceptWaveform(samples: tail, sampleRate: 16000);
-          recognizer.decode(s);
-          transcript = recognizer.getResult(s).text;
-          s.free();
-        } catch (e) {
-          debugPrint('[VoiceGuard] moonshine confirm failed: $e');
-        }
-        final String text = transcript.toLowerCase().trim();
-        if (text.isEmpty) {
-          // STT came back empty (or failed): fail OPEN on the KWS hit —
-          // missing a real cry for help is worse than a false alarm, and
-          // the user still gets the 5 s cancel window.
-          debugPrint('[VoiceGuard] KWS hit, STT empty — firing on KWS');
-          await fireKeyword(VoiceGuardService.keywords.first);
-          return;
-        }
-        for (final keyword in VoiceGuardService.keywords) {
-          if (phraseMatches(text, keyword)) {
-            debugPrint('[VoiceGuard] KWS hit confirmed by STT: "$text"');
-            await fireKeyword(keyword);
-            return;
-          }
-        }
-        debugPrint('[VoiceGuard] KWS hit rejected by STT: "$text"');
-      } finally {
-        confirming = false;
       }
     }
 
@@ -596,9 +449,10 @@ Future<void> _onStart(ServiceInstance service) async {
       return;
     }
 
-    // IMPORTANT: keep the per-chunk path light. The Moonshine confirm +
-    // full-screen alarm + pending-trigger write happen in confirmAndFire /
-    // fireKeyword without stalling the mic loop.
+    // IMPORTANT: keep the per-chunk path light. Detection is synchronous
+    // microseconds per chunk (~20 kFLOP/s of RMS + Goertzel); the fire
+    // path (alarm notification + pending-trigger write) runs unawaited so
+    // the mic loop never stalls on notification IO.
     pcmSub = pcm.listen((List<int> c) {
       final Uint8List chunk = c is Uint8List ? c : Uint8List.fromList(c);
       final int n = chunk.length ~/ 2;
@@ -606,30 +460,18 @@ Future<void> _onStart(ServiceInstance service) async {
       for (int i = 0; i < n; i++) {
         int v = chunk[2 * i] | (chunk[2 * i + 1] << 8);
         if (v >= 32768) v -= 65536;
-        final double f = v / 32768.0;
-        samples[i] = f;
-        ring[ringPos] = f;
-        ringPos = (ringPos + 1) % ring.length;
-        if (ringCount < ring.length) ringCount++;
+        samples[i] = v / 32768.0;
       }
-      final spot = spotter;
-      final stream = kwsStream;
-      if (spot == null || stream == null) return;
-      stream.acceptWaveform(samples: samples, sampleRate: 16000);
-      while (spot.isReady(stream)) {
-        spot.decode(stream);
-      }
-      if (spot.getResult(stream).keyword.isEmpty) return;
-      // Reset so the SAME utterance cannot re-fire while confirming.
-      debugPrint('[VoiceGuard] KWS hit, confirming with STT');
-      spot.reset(stream);
-      unawaited(confirmAndFire());
+      final String? hit = detector.processChunk(samples);
+      if (hit == null) return;
+      debugPrint('[VoiceGuard] distress sound detected: $hit');
+      unawaited(fireKeyword(hit));
     }, onError: (Object e) {
       debugPrint('[VoiceGuard] mic stream error: $e');
     });
 
-    debugPrint('VoiceGuard Sherpa engine started, listening');
-    note('Listening for "help me"');
+    debugPrint('VoiceGuard sound engine started, listening');
+    note('Listening for loud sounds & whistle');
     service.invoke(VoiceGuardService._statusEvent, {'running': true});
   } catch (e, s) {
     developer.log(
