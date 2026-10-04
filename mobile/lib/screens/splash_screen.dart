@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../core/theme.dart';
+import '../services/voice_guard_service.dart';
 import '../state/auth_provider.dart';
 import 'login_screen.dart';
 import 'user_dashboard_screen.dart';
@@ -21,8 +22,15 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   Future<void> _restore() async {
+    await VoiceGuardService.flog('splash', '_restore started');
     final auth = context.read<AuthProvider>();
-    await auth.restoreSession();
+    try {
+      await auth.restoreSession().timeout(const Duration(seconds: 15));
+    } catch (e) {
+      await VoiceGuardService.flog('splash', 'restoreSession FAILED/hung: $e');
+    }
+    await VoiceGuardService.flog(
+        'splash', '_restore done, authenticated=${auth.isAuthenticated}');
     if (!mounted) return;
 
     if (auth.isAuthenticated) {

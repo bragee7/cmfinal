@@ -44,6 +44,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
   @override
   void initState() {
     super.initState();
+    VoiceGuardService.flog('route', 'dashboard shown');
     _glowController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 2),
@@ -602,7 +603,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
           Expanded(
             child: Text(
               sos.voiceEnabled
-                  ? 'Voice Protection Active - Listening for loud sounds & whistle'
+                  ? 'Voice Protection Active - Listening for "help me"'
                   : '24/7 Voice Protection Off',
               style: const TextStyle(color: AppColors.green400, fontSize: 13),
             ),
@@ -1276,7 +1277,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
                 child: _howItWorksStep('1', AppColors.blue600, 'Voice recognition is always active in background'),
               ),
               Expanded(
-                child: _howItWorksStep('2', AppColors.orange600, 'Whistle or scream loudly'),
+                child: _howItWorksStep('2', AppColors.orange600, 'Say "help me" — SOS fires even with the app closed'),
               ),
               Expanded(
                 child: _howItWorksStep('3', AppColors.red600, '30-second recording will be sent to police'),
@@ -1289,66 +1290,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
   }
 
   Widget _buildVoicePhrasesSettings() {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: AppColors.gray800,
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          const Text(
-            'Voice Sound Triggers',
-            style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600, color: Colors.white),
-          ),
-          const SizedBox(height: 4),
-          const Text(
-            'Detected on-device with sound analysis (no AI, works offline).',
-            style: TextStyle(fontSize: 13, color: Colors.grey),
-          ),
-          const SizedBox(height: 16),
-          _soundTriggerRow(
-            Icons.campaign,
-            'Whistle',
-            'A deliberate whistle, held about 1 second',
-          ),
-          const SizedBox(height: 8),
-          _soundTriggerRow(
-            Icons.volume_up,
-            'Loud sound',
-            'A sustained scream-level blast',
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _soundTriggerRow(IconData icon, String title, String subtitle) {
-    return Row(
-      children: [
-        Icon(icon, color: AppColors.green400, size: 22),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                title,
-                style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white),
-              ),
-              Text(
-                subtitle,
-                style: const TextStyle(fontSize: 13, color: Colors.grey),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
+    return const _TriggerWordsCard();
   }
 
   Widget _howItWorksStep(String number, Color color, String text) {
@@ -1433,6 +1375,153 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
             textAlign: TextAlign.center,
             style: TextStyle(color: AppColors.gray500, fontSize: 11),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TriggerWordsCard extends StatefulWidget {
+  const _TriggerWordsCard();
+
+  @override
+  State<_TriggerWordsCard> createState() => _TriggerWordsCardState();
+}
+
+class _TriggerWordsCardState extends State<_TriggerWordsCard> {
+  final _controller = TextEditingController();
+  List<String> _words = const ['Help me'];
+  bool _loading = true;
+  bool _saving = false;
+  String? _message;
+  bool _messageOk = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final words = await VoiceGuardService.getTriggerWords();
+    if (!mounted) return;
+    setState(() {
+      _words = words;
+      _controller.text = words.join(', ');
+      _loading = false;
+    });
+  }
+
+  Future<void> _save() async {
+    final parts = _controller.text
+        .split(',')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList();
+    if (parts.isEmpty) {
+      setState(() {
+        _message = 'Enter at least one word.';
+        _messageOk = false;
+      });
+      return;
+    }
+    setState(() {
+      _saving = true;
+      _message = null;
+    });
+    final result = await VoiceGuardService.setTriggerWords(parts);
+    if (!mounted) return;
+    setState(() {
+      _saving = false;
+      _words = result.words;
+      _controller.text = result.words.join(', ');
+      _message = result.message;
+      _messageOk = result.ok;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: AppColors.gray800,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'Trigger Words',
+            style: TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: Colors.white),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            _loading
+                ? 'Loading…'
+                : 'Say ${_words.map((w) => '"$w"').join(' or ')} — SOS fires even with the app closed.',
+            style: const TextStyle(fontSize: 13, color: Colors.grey),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _controller,
+            enabled: !_loading && !_saving,
+            style: const TextStyle(color: Colors.white),
+            decoration: InputDecoration(
+              hintText: 'help me',
+              hintStyle: const TextStyle(color: Colors.grey),
+              filled: true,
+              fillColor: AppColors.gray900,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: BorderSide.none,
+              ),
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Separate multiple words with commas (max 3). Common English works best.',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+          const SizedBox(height: 12),
+          ElevatedButton(
+            onPressed: (_loading || _saving) ? null : _save,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.green500,
+              foregroundColor: Colors.white,
+            ),
+            child: _saving
+                ? const SizedBox(
+                    height: 18,
+                    width: 18,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white,
+                    ),
+                  )
+                : const Text('Save trigger word'),
+          ),
+          if (_message != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              _message!,
+              style: TextStyle(
+                fontSize: 13,
+                color: _messageOk ? AppColors.green400 : Colors.orange,
+              ),
+            ),
+          ],
         ],
       ),
     );

@@ -13,7 +13,16 @@ import 'state/sos_controller.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await VoiceGuardService.initialize();
+  await VoiceGuardService.flog('main-boot', 'main() entered, calling initialize');
+  try {
+    await VoiceGuardService.initialize()
+        .timeout(const Duration(seconds: 20), onTimeout: () {
+      throw StateError('VoiceGuardService.initialize() timed out after 20s');
+    });
+  } catch (e) {
+    await VoiceGuardService.flog('main-boot', 'initialize FAILED (app continues): $e');
+  }
+  await VoiceGuardService.flog('main-boot', 'initialize done, runApp now');
   runApp(const ZeldApp());
 }
 
