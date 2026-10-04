@@ -3252,6 +3252,20 @@ Install DONE, launch/verify/test BLOCKED on flaky USB. Handed user manual steps:
 ---
 
 ### Thinking
+FGS manifest fix rebuilt + reinstalled. Verify launch crash gone.
+
+### Tool: bash
+- `adb install -r app-debug.apk` → Success.
+- monkey launch → MainActivity topResumedActivity, visible=true. NO crash dialog.
+- run-as tail voice-debug.log: `[main] startService() returned`, `[bg] isolate booted`, `[sosexec] executor loop started`, `[bg] executor-up`, watchdog running, `bindings-ok`, `download-start`, `models-ready` (cached bundle). FGS crash FIXED, BG voice engine boots.
+- Follow-up grep → `no devices/emulators found`; re-poll after 8s → EMPTY. USB flapped again.
+
+### Assistant metadata
+Crash fix VERIFIED on-device (app launches, BG isolate + executor run). Device link dropped again. User holds phone: must log in manually (session wiped), toggle Voice ON, then spec tests. Session log appended; compression due (MAX CONTEXT).
+
+---
+
+### Thinking
 User ordered: push entire project to new repo Z_new_voice_model-04-10-26- + include all content + add today's date (2026-10-04). Checked status (6 modified + 2 untracked, .omo tiny 214 bytes), ls-remote new repo empty = exists, zero refs. Added remote `newvoice`, wrote RELEASE-2026-10-04.md (date + snapshot contents), staged all, committed, pushed.
 
 ### Tool: bash
@@ -3283,6 +3297,28 @@ User explained the 'MIT License - Built for safety and protection' footer questi
 
 ### Assistant metadata
 cmfinal is now fully up to date (bacc8bb = 75a23ee snapshot + session log). Standing rule going forward: after every code edit + log append, commit + push to cmfinal main consistently.
+
+---
+
+### Thinking
+User posted FINAL DETAILED TASK: background SOS must execute fully without opening app (voice 'help me' + 3x power), 5s cancel UI per reference image (Zelda Emergency SOS, live 5..1, swipe-to-cancel, no 'Touch & hold'), all states (in-app/home/lock/BG/activity-dead), no duplicates, minimal changes. Plan mode: launched 3 explore agents (SOS lifecycle, Android BG layer, evidence pipeline) → root cause: all timers/recording/send live in main-isolate SosController born only at dashboard mount; BG/native only stash pending prefs + notification. Presented plan + 3 tradeoff questions; user skipped, said 'continue the task assign the todo list and refer the image for design' (8 todos, defaults: keep 5s+3s, native video+audio fallback, swipe-cancel).
+
+### Tool: edit/bash (background-SOS implementation)
+- NEW mobile/lib/services/sos_executor.dart: BG-isolate authoritative SOS state machine (cancelWindow5s/countdown3s/recording/sending/sent, 1s tick, prefs mirror, invoke protocol sos_state/trigger/cancel/app-recording, voice+power+manual triggers, single-active dedupe, native-record wait 60s + app fallback 45s, BG send via SosService+token, GPS+30s tracking, audio-only fallback, mic pause/resume hooks).
+- voice_guard_service.dart: executor onBoot first (standby when voice off), fireKeyword→executor+native alarm_request, FGS +location, locationAlways best-effort, mic loop start/stopMicLoop + hooks.
+- sos_controller.dart: observer (sosStateStream, 1s mirror sync, BG-first trigger/cancel, recordForExecutor 30s reporting back); user_dashboard_screen.dart: cancel card restyled per reference (black, coral-ring number, Dismissible swipe-to-cancel).
+- sos_service.dart: audio hoisted out of video gate. Native: SosAlarmActivity (lock-screen, FSI target), SosRecordingService (CameraX video/audio fallback, camera FGS), PowerGuard 500ms coordinator + FSI retarget, receiver/boot alarm_request, manifest CAMERA+LOCATION FGS + ACCESS_BACKGROUND_LOCATION.
+- Launch crash fixed: BackgroundService manifest FGS 'microphone' → 'microphone|location' (0x88-vs-0x80 startForeground RuntimeException).
+- analyze clean, APKs built, installed (multiple -r Success), app launches clean.
+
+### Tool: bash/adb (self-test ground truth)
+- REAL voice trigger 13:19 (source=voice:Help me) → countdown → native recording → 3 audio-only .m4a evidences (2x13:17, 1x13:20 45KB).
+- SosService POSTed: prefs case_id=0ff72c3c. Server GET as devicetest1 showed 9 old manual cases (Sep 28-29) — then GET /api/sos/0ff72c3c → 403 vs random UUID → 404: case EXISTS under phone's account (flutter.auth_user=Test User user@guardian.com), my check used wrong account. PROVEN E2E: voice SOS sends (glitch = verification artifact, no app bug).
+- Power test: pref OFF gates keyevents correctly (negative pass); run-as kill worked (swipe-away-like); sed flip true survived relaunch; but 3x keyevent 26 → no trigger (process dead incl. services at first; after relaunch still none — NO PowerGuard/voice-BG running, only Geolocator; engine-up staged 13:45 then died; services don't self-restart in foreground, user taps involved). adb cannot start exported=false services → unattended trigger testing exhausted; asked user for taps.
+- User: 'if this todo list are completed mark it as completed and close it' → auditing now: committing everything to cmfinal.
+
+### Assistant metadata
+Background-SOS + flicker-fix code complete, voice E2E send proven, power live-fire + flicker-observed-live still need user's 2-min taps. Pushing all deltas to cmfinal below.
 
 ---
 

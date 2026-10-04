@@ -454,42 +454,124 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
     }
   }
 
+  /// Zelda Emergency SOS cancel window — styled after the Android Emergency
+  /// SOS reference: dark screen, title, big live countdown in a coral ring,
+  /// swipe-to-cancel bar at the bottom. The SOS is ALREADY triggered, so
+  /// there is no "start" action anywhere here — only cancel.
   Widget _buildCancelWindow(SosController sos) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 16),
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 8),
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.red500, width: 1.5),
+      ),
       child: Column(
         children: [
-          Text(
-            '${sos.cancelTimer ?? 0}',
-            style: const TextStyle(
-              fontSize: 64,
-              fontWeight: FontWeight.bold,
-              color: AppColors.orange500,
+          const Text(
+            'Zelda Emergency SOS',
+            style: TextStyle(
+              fontSize: 26,
+              fontWeight: FontWeight.w600,
+              color: Colors.white,
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 12),
+          const Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Your phone will:',
+              style: TextStyle(fontSize: 16, color: AppColors.gray300),
+            ),
+          ),
+          const SizedBox(height: 6),
+          const Row(
+            children: [
+              Icon(Icons.check, color: Colors.green, size: 20),
+              SizedBox(width: 10),
+              Text(
+                'Send SOS + record evidence',
+                style: TextStyle(fontSize: 17, color: Colors.white),
+              ),
+            ],
+          ),
+          const SizedBox(height: 28),
+          Container(
+            width: 210,
+            height: 210,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: const Color(0xFFEF6C5B),
+                width: 8,
+              ),
+            ),
+            alignment: Alignment.center,
+            child: Text(
+              '${sos.cancelTimer ?? 0}',
+              style: const TextStyle(
+                fontSize: 84,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
           Text(
-            'SOS will be sent in ${sos.cancelTimer ?? 0} seconds',
+            'SOS sends in ${sos.cancelTimer ?? 0}s — swipe to cancel',
             textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 18, color: Colors.white),
+            style:
+                const TextStyle(fontSize: 15, color: AppColors.gray300),
           ),
           const SizedBox(height: 20),
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton(
-              onPressed: sos.cancelSOS,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.gray700,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 18),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
-                  side: const BorderSide(color: AppColors.red500, width: 2),
-                ),
+          Dismissible(
+            key: const ValueKey('zelda-sos-cancel-bar'),
+            direction: DismissDirection.startToEnd,
+            dismissThresholds: const {
+              DismissDirection.startToEnd: 0.45,
+            },
+            background: Container(
+              alignment: Alignment.centerLeft,
+              padding: const EdgeInsets.only(left: 24),
+              decoration: BoxDecoration(
+                color: AppColors.red600,
+                borderRadius: BorderRadius.circular(40),
               ),
-              child: const Text(
-                '✕ CANCEL SOS',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              child: const Icon(Icons.close, color: Colors.white, size: 30),
+            ),
+            onDismissed: (_) => sos.cancelSOS(),
+            child: GestureDetector(
+              onTap: sos.cancelSOS,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
+                decoration: BoxDecoration(
+                  color: AppColors.gray700,
+                  borderRadius: BorderRadius.circular(40),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: const BoxDecoration(
+                        color: Colors.white,
+                        shape: BoxShape.circle,
+                      ),
+                      alignment: Alignment.center,
+                      child: const Icon(Icons.close,
+                          color: Color(0xFF7A1F1F), size: 32),
+                    ),
+                    const SizedBox(width: 16),
+                    const Text(
+                      'Cancel',
+                      style: TextStyle(fontSize: 20, color: Colors.white),
+                    ),
+                    const Spacer(),
+                    const Icon(Icons.swipe_right,
+                        color: AppColors.gray300, size: 22),
+                  ],
+                ),
               ),
             ),
           ),

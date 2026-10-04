@@ -62,6 +62,14 @@ android {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
+    // CameraX for background SOS evidence recording (SosRecordingService).
+    val cameraxVersion = "1.3.4"
+    implementation("androidx.camera:camera-core:${cameraxVersion}")
+    implementation("androidx.camera:camera-camera2:${cameraxVersion}")
+    implementation("androidx.camera:camera-lifecycle:${cameraxVersion}")
+    implementation("androidx.camera:camera-video:${cameraxVersion}")
+    // ListenableFuture for ProcessCameraProvider.getInstance().
+    implementation("com.google.guava:guava:32.1.2-android")
 }
 
 flutter {

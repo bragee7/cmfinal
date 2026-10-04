@@ -15,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart';
 
 import 'keyword_model_manager.dart';
+import 'sos_executor.dart';
 
 class VoiceGuardService {
   static const _detectionEvent = 'keyword_detected';
@@ -51,6 +52,17 @@ class VoiceGuardService {
   static final _detectionController = StreamController<String>.broadcast();
   static final _statusController = StreamController<bool>.broadcast();
   static final _errorController = StreamController<String>.broadcast();
+  static final _sosStateController =
+      StreamController<Map<String, Object?>>.broadcast();
+  static final _appRecordingController = StreamController<void>.broadcast();
+
+  /// Fire-and-forget invoke on the BG isolate (no-op when it is not
+  /// running — callers that need certainty check isRunning() first).
+  static void serviceInvoke(String event, [Map<String, dynamic>? args]) {
+    try {
+      _service.invoke(event, args);
+    } catch (_) {}
+  }
 
   static bool _notificationsReady = false;
 
@@ -91,6 +103,9 @@ class VoiceGuardService {
   static const _resetCooldownEvent = 'reset_cooldown';
   static const _setForegroundEvent = 'set_foreground';
   static const _serviceReadyEvent = 'service_ready';
+  /// Public alias of [_resetCooldownEvent] for the BG SOS executor
+  /// (separate library; the private name is not visible there).
+  static const String resetCooldownEventName = 'reset_cooldown';
   static const _pendingTriggerKey = 'zelda_pending_sos_trigger';
   // Main-isolate mic verdict (reliable — has an Activity). The BG isolate's
   // record.hasPermission() lies (returns false on MIUI despite OS grant), so
@@ -288,6 +303,15 @@ class VoiceGuardService {
   static Stream<String> get detections => _detectionController.stream;
   static Stream<bool> get statusStream => _statusController.stream;
   static Stream<String> get errors => _errorController.stream;
+  /// Live SOS executor snapshots (BG authority): state, remaining, source,
+  /// busy/cancelled/sent flags. The dashboard mirrors these — it never runs
+  /// its own timers while a BG engine is alive.
+  static Stream<Map<String, Object?>> get sosStateStream =>
+      _sosStateController.stream;
+  /// The BG executor asks the open app to run its CameraController recording
+  /// (only fires while the app is foregrounded at countdown end).
+  static Stream<void> get appRecordingRequests =>
+      _appRecordingController.stream;
 
   static bool _configured = false;
 
@@ -325,7 +349,13 @@ class VoiceGuardService {
         initialNotificationTitle: 'ZELDA Voice Protection',
         initialNotificationContent: 'Listening for trigger word',
         foregroundServiceNotificationId: fgsNotificationId,
-        foregroundServiceTypes: [AndroidForegroundType.microphone],
+        // microphone: KWS listener. location: the BG SOS executor takes the
+        // fresh SOS fix + live tracking from this same isolate (background
+        // location needs the location FGS type + ACCESS_BACKGROUND_LOCATION).
+        foregroundServiceTypes: [
+          AndroidForegroundType.microphone,
+          AndroidForegroundType.location,
+        ],
       ),
       iosConfiguration: IosConfiguration(autoStart: false),
     );
@@ -366,6 +396,20 @@ class VoiceGuardService {
         {'foreground': _appInForeground},
       );
     });
+    // BG SOS executor snapshots (SosExecutor.sosStateEvent). The dashboard
+    // mirrors these so an app opened mid-SOS shows the LIVE countdown.
+    _service.on('sos_state').listen((event) {
+      if (event == null) return;
+      try {
+        _sosStateController.add(Map<String, Object?>.from(event as Map));
+      } catch (_) {}
+    });
+    // BG asks the open app to record with the CameraController pipeline
+    // (SosExecutor.sosStartAppRecording); the controller reports back via
+    // SosExecutor.onAppRecordingDone.
+    _service.on('sos_start_app_recording').listen((_) {
+      if (!_appRecordingController.isClosed) _appRecordingController.add(null);
+    });
   }
 
   static Future<void> start() async {
@@ -404,6 +448,17 @@ class VoiceGuardService {
       await flog('main', 'battery-opt request done');
     } catch (e) {
       await flog('main', 'battery-opt request stalled: $e');
+    }
+    // Background SOS needs a background location fix for the case payload
+    // + live tracking. Best-effort: denial only degrades the fix to the
+    // last-known/foreground position, never blocks voice protection.
+    try {
+      final loc = await Permission.locationAlways
+          .request()
+          .timeout(const Duration(seconds: 8));
+      await flog('main', 'locationAlways request done granted=${loc.isGranted}');
+    } catch (e) {
+      await flog('main', 'locationAlways request stalled: $e');
     }
     try {
       final prefs = await SharedPreferences.getInstance()
@@ -692,6 +747,33 @@ Future<void> _onStart(ServiceInstance service) async {
   service.invoke(VoiceGuardService._serviceReadyEvent);
   await VoiceGuardService.markStage('isolate-booted');
 
+  // ── BG SOS executor boots FIRST, unconditionally ──
+  // Cheap (prefs + timers only): power-button triggers get a live executor
+  // even when voice listening is disabled, and the 5s countdown no longer
+  // waits for the app to open. The spotter/mic below only starts when voice
+  // protection is enabled.
+  await SosExecutor.onBoot(service, () => appInForeground);
+  await VoiceGuardService.markStage('executor-up');
+  await VoiceGuardService.flog('bg', 'executor-up');
+
+  bool voiceOn = true;
+  try {
+    voiceOn = await VoiceGuardService.wasEnabled()
+        .timeout(const Duration(seconds: 5));
+  } catch (e) {
+    await VoiceGuardService.flog('bg', 'enabled-pref unreadable, attempting mic: $e');
+  }
+  if (!voiceOn) {
+    note('SOS guard standby');
+    await VoiceGuardService.markStage('engine-standby');
+    await VoiceGuardService.flog('bg', 'STANDBY (voice off, executor only)');
+    service.invoke(VoiceGuardService._statusEvent, {'running': false});
+    Timer.periodic(const Duration(seconds: 10), (_) {
+      service.invoke('heartbeat');
+    });
+    return;
+  }
+
   // ── Keyword-spotter engine (KWS only, no speech-to-text stage) ──
   // The Zipformer spotter hears trigger WORDS straight from the mic stream,
   // so there is no transcription step: hits fire directly (low latency),
@@ -811,17 +893,38 @@ Future<void> _onStart(ServiceInstance service) async {
       VoiceGuardService._lastTriggeredAt = now;
       VoiceGuardService._lastTriggeredKeyword = keyword;
       developer.log('Keyword confirmed: $keyword', name: 'VoiceGuard');
+      // BG executor is authoritative: the 5s cancel window starts HERE, in
+      // this isolate, whether the app is open or not.
+      unawaited(SosExecutor.onTrigger('voice:$keyword'));
       service.invoke(VoiceGuardService._detectionEvent, {'keyword': keyword});
       if (!appInForeground) {
         await VoiceGuardService._markPendingTrigger();
-        await VoiceGuardService.showEmergencyNotificationFromBackground(
-          keyword: keyword,
-        );
+        // Single native full-screen alarm (SosAlarmActivity over home/lock
+        // screen), posted by the persistent PowerGuardService poller — the
+        // old Dart FSI notification is replaced by it (no duplicates).
+        await SosExecutor.requestNativeAlarm();
       }
     }
 
     final mic = AudioRecorder();
     recorder = mic;
+
+    Future<void> stopMicLoop() async {
+      try {
+        await pcmSub?.cancel();
+      } catch (_) {}
+      pcmSub = null;
+      if (recorder != null) {
+        try {
+          await recorder!.stop();
+        } catch (_) {}
+      }
+      await VoiceGuardService.flog('bg', 'mic loop paused by executor');
+    }
+
+    // (Re)starts the mic stream + KWS chunk loop. Idempotent: a live loop
+    // is left alone. Returns false when the mic genuinely cannot start.
+    Future<bool> startMicLoop() async {
     // Attempt-first mic open: the MAIN-isolate verdict stash lives in
     // FlutterSharedPreferences, which is ABSENT on this ROM (writes vanish),
     // and record.hasPermission() inside this BG isolate lies on MIUI (false
@@ -849,7 +952,7 @@ Future<void> _onStart(ServiceInstance service) async {
         VoiceGuardService._errorEvent,
         {'error': 'Microphone permission denied'},
       );
-      return;
+      return false;
     }
 
     // IMPORTANT: keep the per-chunk path light. The full-screen alarm +
@@ -881,6 +984,12 @@ Future<void> _onStart(ServiceInstance service) async {
     }, onError: (Object e) {
       debugPrint('[VoiceGuard] mic stream error: $e');
     });
+      await VoiceGuardService.flog('bg', 'mic loop (re)started');
+      return true;
+    }
+
+    SosExecutor.bindMicHooks(onPause: stopMicLoop, onResume: startMicLoop);
+    if (!await startMicLoop()) return;
 
     debugPrint('VoiceGuard KWS engine started, listening');
     note('Listening for "${activeWords.first.toLowerCase()}"');
