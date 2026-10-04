@@ -3273,4 +3273,17 @@ DONE. Full arc closed: no-AI DSP detour → word-trigger KWS restore (fp32, KWS-
 
 ---
 
+### Thinking
+User explained the 'MIT License - Built for safety and protection' footer question (answered: MIT = permissive open-source license, tagline = app purpose; informational, no action). User then ordered: push each and every code + every execution ONLY to cmfinal consistently, including every action in this session. Presented plan (check remote → stage all → commit → push cmfinal main → verify → repeat going forward); user said 'go' (build mode). `git remote -v` confirms `cmfinal` remote already exists. Only delta since 75a23ee = session-ses_f751.md.
+
+### Tool: bash
+- `git add -A` + `git commit -m 'Session update 2026-10-04: all voice triggers working, session log + snapshot'` → `bacc8bb`, 1 file, 22 insertions.
+- `git push cmfinal HEAD:main` → `c9c9802..bacc8bb HEAD -> main`. No force needed, no conflicts.
+- `git ls-remote cmfinal HEAD main` → HEAD + refs/heads/main at bacc8bb. VERIFIED.
+
+### Assistant metadata
+cmfinal is now fully up to date (bacc8bb = 75a23ee snapshot + session log). Standing rule going forward: after every code edit + log append, commit + push to cmfinal main consistently.
+
+---
+
 
