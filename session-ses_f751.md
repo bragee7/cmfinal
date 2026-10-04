@@ -3251,4 +3251,26 @@ Install DONE, launch/verify/test BLOCKED on flaky USB. Handed user manual steps:
 
 ---
 
+### Thinking
+User ordered: push entire project to new repo Z_new_voice_model-04-10-26- + include all content + add today's date (2026-10-04). Checked status (6 modified + 2 untracked, .omo tiny 214 bytes), ls-remote new repo empty = exists, zero refs. Added remote `newvoice`, wrote RELEASE-2026-10-04.md (date + snapshot contents), staged all, committed, pushed.
+
+### Tool: bash
+- `git remote add newvoice https://github.com/bragee7/Z_new_voice_model-04-10-26-.git`
+- `git add -A` + commit `Full project snapshot 2026-10-04: word-trigger voice build (help me + custom words, KWS-only, background/app-off SOS)` — 11 files (incl. keyword_model_manager.dart, session log, RELEASE file).
+- `git push newvoice main` → `* [new branch] main -> main`.
+- `git ls-remote newvoice` → HEAD + refs/heads/main at 75a23ee. VERIFIED.
+
+### Assistant metadata
+Push DONE and verified. Still pending from before: user manual login + MIC ON on phone, then ENGINE-UP verify + say-help-me test.
+
+---
+
+### Thinking
+User reports: 'bro all thing are working perfectly' = word-trigger SOS works end-to-end on the phone (say 'help me' → alert, incl. background/app-off path). Task complete. All todos ticked completed.
+
+### Assistant metadata
+DONE. Full arc closed: no-AI DSP detour → word-trigger KWS restore (fp32, KWS-only, custom words) → attempt-first mic fix → pm grants → user on-phone test → working. Pushed snapshot repo Z_new_voice_model-04-10-26- @75a23ee with RELEASE-2026-10-04.md.
+
+---
+
 
