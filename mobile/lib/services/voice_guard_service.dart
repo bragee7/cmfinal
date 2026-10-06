@@ -51,6 +51,11 @@ class VoiceGuardService {
 
   static final _detectionController = StreamController<String>.broadcast();
   static final _statusController = StreamController<bool>.broadcast();
+  // Sticky copy of the last ENGINE-UP state. Broadcast controllers drop
+  // events with zero listeners, so a running:true fired before anyone
+  // subscribed (fast cached-model boot, activity recreation) would be lost
+  // forever — the watchdog seeds from this and re-queries the live engine.
+  static bool _lastRunning = false;
   static final _errorController = StreamController<String>.broadcast();
   static final _sosStateController =
       StreamController<Map<String, Object?>>.broadcast();
@@ -375,6 +380,7 @@ class VoiceGuardService {
           'Service status: running=${event['running']}',
           name: 'VoiceGuard',
         );
+        _lastRunning = event['running'] as bool;
         _statusController.add(event['running'] as bool);
       }
     });
@@ -494,10 +500,18 @@ class VoiceGuardService {
     // (2) service starts then dies — native crash during boot;
     // (3) service alive but engine never ready — download/spotter/mic stall,
     // with the last BG stage marker naming the exact step.
-    var engineUp = false;
+    // Sticky seed + live re-query: ENGINE-UP may have fired before this
+    // isolate subscribed (fast cached-model boot beats main to it; or the
+    // activity was recreated while BG kept running). Broadcast drops events
+    // with zero listeners, so without this the watchdog waits 90 s for an
+    // event that already happened, then raises a false STALL. A dead engine
+    // simply never replies and the poll loop below reports the true state.
+    var engineUp = _lastRunning;
     final statusSub = _statusController.stream.listen((running) {
+      _lastRunning = running;
       if (running) engineUp = true;
     });
+    VoiceGuardService.serviceInvoke('query_status');
     try {
       final deadline = DateTime.now().add(const Duration(seconds: 90));
       final fastFailAt = deadline.subtract(const Duration(seconds: 75));
@@ -696,6 +710,9 @@ Future<void> _onStart(ServiceInstance service) async {
   OnlineStream? kwsStream;
   AudioRecorder? recorder;
   StreamSubscription<List<int>>? pcmSub;
+  // Live ENGINE-UP state for the main isolate's query_status round-trip
+  // (a state the watchdog can ask for, not an event it might have missed).
+  var engineRunning = false;
 
   // Register the stop handler FIRST — before any fallible engine work.
   // If model/mic setup throws, _onStart returns early via catch; a late
@@ -720,6 +737,14 @@ Future<void> _onStart(ServiceInstance service) async {
     kwsStream?.free();
     spotter?.free();
     service.stopSelf();
+  });
+
+  // The main isolate asks for the CURRENT running state on every start():
+  // ENGINE-UP is a state, not an event — a broadcast fired before main
+  // subscribed is dropped, so main re-queries instead of trusting its luck.
+  // No-op when the engine is dead (the watchdog then reports the true state).
+  service.on('query_status').listen((_) {
+    service.invoke(VoiceGuardService._statusEvent, {'running': engineRunning});
   });
 
   var appInForeground = false;
@@ -916,7 +941,7 @@ Future<void> _onStart(ServiceInstance service) async {
       pcmSub = null;
       if (recorder != null) {
         try {
-          await recorder!.stop();
+          await recorder.stop();
         } catch (_) {}
       }
       await VoiceGuardService.flog('bg', 'mic loop paused by executor');
@@ -995,6 +1020,7 @@ Future<void> _onStart(ServiceInstance service) async {
     note('Listening for "${activeWords.first.toLowerCase()}"');
     await VoiceGuardService.markStage('engine-up');
     await VoiceGuardService.flog('bg', 'ENGINE-UP listening');
+    engineRunning = true;
     service.invoke(VoiceGuardService._statusEvent, {'running': true});
   } catch (e, s) {
     await VoiceGuardService.flog('bg', 'BG-CATCH: $e');
@@ -1006,6 +1032,7 @@ Future<void> _onStart(ServiceInstance service) async {
     debugPrint('VoiceGuard BG service failed: $e\n$s');
     note('Voice guard error — open app for details');
     service.invoke(VoiceGuardService._errorEvent, {'error': '$e'});
+    engineRunning = false;
     service.invoke(VoiceGuardService._statusEvent, {'running': false});
     return;
   }

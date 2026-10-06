@@ -3401,3 +3401,22 @@ Flicker + crash work DONE and pushed. Only TEST F (rotation, needs unlock) and f
 
 ---
 
+## 2026-10-06 - Watchdog ENGINE-UP race fix (banner false-negative) + verify
+
+### Assistant thinking
+User reported persistent dashboard banner "Failed to start voice protection: Bad state: Voice engine is starting but not ready after 90 s. Last stage: main-start (90s ago)..." after force-stop relaunch. Read voice_guard_service.dart: watchdog start() 488-549 waits 90s on _statusController broadcast fed only by _service.on(_statusEvent); BG _onStart 673-775 fires ENGINE-UP + running:true once at boot. Decisive logcat -c capture (fresh boot PID 891 10:41:27): ENGINE-UP 10:41:32.74 fired 5s BEFORE main start() 10:41:37 subscribed, broadcast with zero listeners dropped, bootcap.txt zero FATAL => not a no-boot. Engine boots in ~5s on warm models; 10:26 boot worked only because first-run 13MB download was slower than main. Same mechanism as the 10:32 activity-recreation false-negative (voice toggle forced OFF while mic actually live). Fix: sticky static _lastRunning + service.on('query_status') BG re-query handler; watchdog seeds from sticky and re-queries (dead engine never replies => existing 90s timeout path stays truthful).
+
+### Tool Input
+- 8 edits to mobile/lib/services/voice_guard_service.dart (sticky _lastRunning, listener update, BG engineRunning flag, query_status handler, set/reset at ENGINE-UP/catch, watchdog seed + re-query via serviceInvoke); fixed pre-existing lint recorder!.stop() => recorder.stop() (:944).
+- flutter analyze => No issues found. flutter build apk --debug => Built 17.2s.
+- adb install -r Success + monkey launch (locked phone OK).
+
+### Tool Output
+- 10:44 boot (new build): ENGINE-UP 10:44:49, start() 10:44:53, "watchdog: engineUp signal received, success" 10:44:54 — same race timing that STALLed on the old 10:41 boot. Clean A/B proof on identical timing.
+- Pending at write time: this log entry, commit + push cmfinal, short addendum (final 10-section flicker report already delivered).
+
+### Assistant metadata
+Watchdog race FIXED and verified on device. TEST F rotation still needs user unlock. Untracked leftovers: new_session(6-10-26).md, sos_power_cancel.png, now.png.
+
+---
+
