@@ -3322,4 +3322,60 @@ Background-SOS + flicker-fix code complete, voice E2E send proven, power live-fi
 
 ---
 
+### Thinking
+User asked last unfinished task, said continue. Re-read new_session(6-10-26).md 1850-2600 + 2600-3231. Found stuck-SOS RECORDING/21 unrecovered, dirty post-64f98cf tree (sos_executor, sos_controller, splash), dashboard never mounts after splash pushReplacement, nativeDone type mismatch suspicion, countdown 5+3 vs direct conflict, device offline flapping, server account confound.
+
+### Tool: read
+- new_session(6-10-26).md offset 1850 tail + 2600-3231 re-read, confirmed Next Move 1-3, HEAD 64f98cf, dirty files list, Doze ruled out, main-thread spin note.
+
+### Assistant metadata
+State: device task BLOCKED on user (Redmi offline), device-independent nativeDone fix first. Todos created (verify diff / analyze / countdown / device live / log+commit).
+
+---
+
+### Thinking
+Verify nativeDone fix + review full post-64f98cf diff. Device still offline, adb missing from PATH — do code-only verification.
+
+### Tool: bash
+- `git status --short` => M splash_screen.dart, M sos_executor.dart, M sos_controller.dart, ?? new_session(6-10-26).md. HEAD 64f98cf.
+- `git diff HEAD --stat` => 3 files, 117 insertions, 23 deletions.
+- `git diff HEAD` full review: splash adds unmounted-ABORT/nav-attempt/pushReplacement-issued/NAV-FAILED flog + try/catch; executor adds startedAt to readSnapshot + resetMirror() (idle/0, removes command+nativeDone, keeps evidence/caseId); controller adds _staleOwnerMs=180000 gate, _recoverStaleMirror (adopt-once via _adoptedNative else reset+listening), recordingTime local-owner guard, _onAppRecordingDone BG-dead fallback.
+- Findings: nativeDone containsKey already in HEAD (predates delta); startedAt written once in onTrigger never renewed per-tick so gate comment inaccurate but logic sound (live ~38s+send <180s; edge 3-min createCase timeout); live broadcast extras never in readSnapshot; local sendEmergencyData never writes caseId back unlike BG send; indentation-only churn in executor snapshot.
+
+### Tool: grep/read
+- sos_executor.dart:579 `prefs.containsKey(nativeDoneKey)` matches Kotlin SosRecordingService.kt putString "done"/"failed" (:61,289,308,311) + BG wait :377 + resume :146. Controller :251 `snap['nativeDone']==true` bool OK. Type-mismatch FIXED.
+
+### Assistant metadata
+nativeDone fix VERIFIED. Diff reviewed, edge cases noted. Next: analyze + duplicate-adopt verdict.
+
+---
+
+### Thinking
+Duplicate-adopt safety check + flutter analyze on 3 changed files.
+
+### Tool: bash
+- `flutter analyze mobile/lib/services/sos_executor.dart mobile/lib/state/sos_controller.dart mobile/lib/screens/splash_screen.dart` => clean, 3 info lints only (use_build_context_synchronously splash:26,48,52, pre-existing, mounted-guarded), zero errors.
+- Adopt analysis: steady-state safe (in-memory _adoptedNative :68 gates _applySnapshot :251-252 + recovery :184; 2nd stale tick falls to resetMirror+flag reset). Crash between adopt-send and tick-clear re-fires next launch (fresh flag, stale evidence persists) => duplicate case. Live broadcast path bypasses stale gate but shares flag.
+- Countdown left open: BG _poll cancelWindow5->countdown3->recording vs required direct 5->1->Recording; local triggerSOS mirrors 5s+startCountdown 3s (:402-483). Pending user decision.
+
+### Assistant metadata
+Analyze CLEAN. Duplicate-adopt verdict delivered (safe steady-state, crash-window duplicate possible). Countdown decision still open. Device still absent (adb devices EMPTY / not on PATH). Next: commit+push per standing rule (cmfinal only).
+
+---
+
+### Thinking
+User restated 4 tasks, said continue. Task 2: commit+push 3 files to cmfinal. Task 1 device verification still BLOCKED.
+
+### Tool: bash
+- `git add mobile/lib/screens/splash_screen.dart mobile/lib/services/sos_executor.dart mobile/lib/state/sos_controller.dart`
+- `git commit -m 'Stuck-SOS recovery plus dashboard nav tracing 2026-10-06...'` => f1abf1d.
+- `git push cmfinal HEAD:main` => 64f98cf..f1abf1d.
+- `git ls-remote cmfinal` => VERIFIED HEAD + refs/heads/main at f1abf1d.
+- `adb devices` => fails CommandNotFound (not in PATH); flutter analyze already clean.
+
+### Assistant metadata
+Task 2 DONE (f1abf1d pushed+verified). Task 1 still BLOCKED on user (plug Redmi, authorize USB, launch app). Task 3 (this log) in progress. Task 4 (final 10-section report) pending after second push.
+
+---
+
 
