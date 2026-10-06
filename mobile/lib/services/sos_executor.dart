@@ -573,14 +573,29 @@ class SosExecutor {
         'remaining': prefs.getInt(remainingKey) ?? 0,
         'source': prefs.getString(sourceKey) ?? '',
         'caseId': prefs.getString(caseIdKey) ?? '',
-        'videoPath': prefs.getString(videoPathKey) ?? '',
-        'audioPath': prefs.getString(audioPathKey) ?? '',
-        'audioOnly': prefs.getBool(audioOnlyKey) ?? false,
-        'nativeDone': prefs.containsKey(nativeDoneKey),
-        'command': prefs.getString(commandKey) ?? '',
-      };
+      'videoPath': prefs.getString(videoPathKey) ?? '',
+      'audioPath': prefs.getString(audioPathKey) ?? '',
+      'audioOnly': prefs.getBool(audioOnlyKey) ?? false,
+      'nativeDone': prefs.containsKey(nativeDoneKey),
+      'command': prefs.getString(commandKey) ?? '',
+      'startedAt': prefs.getInt(startedAtKey) ?? 0,
+    };
     } catch (_) {
       return {'state': 'idle', 'remaining': 0, 'source': '', 'caseId': ''};
     }
+  }
+
+  /// Clears a stale/orphaned BG mirror so the UI (and future triggers) are
+  /// not haunted by a dead owner's frozen state. Keeps finished evidence and
+  /// the delivered case id intact for adoption.
+  static Future<void> resetMirror() async {
+    try {
+      final prefs = await SharedPreferences.getInstance()
+          .timeout(const Duration(seconds: 5));
+      await prefs.setString(stateKey, 'idle');
+      await prefs.setInt(remainingKey, 0);
+      await prefs.remove(commandKey);
+      await prefs.remove(nativeDoneKey);
+    } catch (_) {}
   }
 }

@@ -31,20 +31,31 @@ class _SplashScreenState extends State<SplashScreen> {
     }
     await VoiceGuardService.flog(
         'splash', '_restore done, authenticated=${auth.isAuthenticated}');
-    if (!mounted) return;
+    if (!mounted) {
+      await VoiceGuardService.flog(
+          'splash', 'ABORT: splash unmounted before nav, no route pushed');
+      return;
+    }
 
-    if (auth.isAuthenticated) {
-      if (auth.user?.role == 'police') {
-        await auth.logout();
-        if (!mounted) return;
+    await VoiceGuardService.flog('splash',
+        'navigating, authenticated=${auth.isAuthenticated} role=${auth.user?.role}');
+    try {
+      if (auth.isAuthenticated) {
+        if (auth.user?.role == 'police') {
+          await auth.logout();
+          if (!mounted) return;
+        }
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => const UserDashboardScreen()),
+        );
+      } else {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => const LoginScreen()),
+        );
       }
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const UserDashboardScreen()),
-      );
-    } else {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const LoginScreen()),
-      );
+      await VoiceGuardService.flog('splash', 'pushReplacement issued');
+    } catch (e) {
+      await VoiceGuardService.flog('splash', 'NAV FAILED: $e');
     }
   }
 

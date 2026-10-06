@@ -66,6 +66,7 @@ class SosController extends ChangeNotifier {
   /// the flow ends so a later SOS can adopt again. Prevents double-send
   /// from the 1s mirror timer re-firing on the same snapshot.
   bool _adoptedNative = false;
+  static const _staleOwnerMs = 180000; // 3 min: longest live flow is ~60s
   bool _voiceEnabled = false;
   bool _powerSosEnabled = true;
   bool _initialized = false;
@@ -153,8 +154,52 @@ class SosController extends ChangeNotifier {
   Future<void> _syncFromExecutor() async {
     try {
       final snap = await SosExecutor.readSnapshot();
+      final raw = (snap['state'] as String?) ?? 'idle';
+      if (raw != 'idle' && raw != 'listening') {
+        // Stale-owner gate: the longest real flow is ~60s (5s cancel + 3s
+        // countdown + 30s record + send), and the native driver renews
+        // started_at on every tick. An active snapshot older than the
+        // threshold is therefore orphaned — even when the BG service
+        // process happens to be alive, no live owner drives it. Applying
+        // it every second would bury local progress and freeze the UI
+        // (e.g. stuck RECORDING 21). Recover instead.
+        final startedAt = (snap['startedAt'] as int?) ?? 0;
+        final age = DateTime.now().millisecondsSinceEpoch - startedAt;
+        if (startedAt <= 0 || age > _staleOwnerMs) {
+          await _recoverStaleMirror(snap);
+          return;
+        }
+      }
       _applySnapshot(snap);
     } catch (_) {}
+  }
+
+  /// Recovers from a dead BG owner's frozen mirror. Adopts finished evidence
+  /// and sends it once; otherwise clears the stale mirror and unfreezes the
+  /// UI without touching live local timers (they own the flow now).
+  Future<void> _recoverStaleMirror(Map<String, Object?> snap) async {
+    if (_status == SosStatus.sending || _status == SosStatus.sent) return;
+    final video = (snap['videoPath'] as String?) ?? '';
+    final audio = (snap['audioPath'] as String?) ?? '';
+    if ((video.isNotEmpty || audio.isNotEmpty) && !_adoptedNative) {
+      _adoptedNative = true;
+      _mirroring = false;
+      _recordedVideoPath = video.isNotEmpty ? video : null;
+      _recordedAudioPath = audio;
+      await sendEmergencyData();
+      return;
+    }
+    await SosExecutor.resetMirror();
+    _mirroring = false;
+    _adoptedNative = false;
+    if (_recordingTimerRef == null &&
+        _cancelTimerRef == null &&
+        _countdownRef == null &&
+        _status != SosStatus.sending &&
+        _status != SosStatus.sent) {
+      _status = SosStatus.listening;
+    }
+    notifyListeners();
   }
 
   void _applySnapshot(Map<String, Object?> snap) {
@@ -193,7 +238,12 @@ class SosController extends ChangeNotifier {
         _countdown = remaining;
         _cancelTimer = null;
       } else if (mapped == SosStatus.recording) {
-        _recordingTime = remaining;
+        // A live local recording timer owns the countdown display. The BG
+        // mirror stays frozen while app-recording assists (or while its owner
+        // is dead) and must not stick the number every second.
+        if (_recordingTimerRef == null) {
+          _recordingTime = remaining;
+        }
         // Native-owned flow finished recording while the app was closed
         // (evidence path + nativeDone in the mirror): adopt the file and
         // complete the send exactly once through the existing pipeline.
@@ -492,10 +542,28 @@ class SosController extends ChangeNotifier {
     _cameraInitialized = false;
     _recordedVideoPath = videoPath;
     _showPreview = false; // the BG chain owns the send; no local preview
-    VoiceGuardService.serviceInvoke(
-      SosExecutor.sosAppRecordingDone,
-      {'videoPath': videoPath ?? '', 'error': failure ?? ''},
-    );
+    try {
+      VoiceGuardService.serviceInvoke(
+        SosExecutor.sosAppRecordingDone,
+        {'videoPath': videoPath ?? '', 'error': failure ?? ''},
+      );
+    } catch (_) {}
+    // Fallback ownership: if the BG executor is dead, nobody acts on the
+    // done report — complete the send locally (or surface the error) instead
+    // of freezing on the recording screen forever.
+    var bgAlive = false;
+    try {
+      bgAlive = await VoiceGuardService.isRunning();
+    } catch (_) {}
+    if (!bgAlive) {
+      if (videoPath != null && videoPath.isNotEmpty) {
+        await sendEmergencyData();
+      } else {
+        _status = SosStatus.listening;
+        _error = failure ?? 'Recording failed. Please try again.';
+        notifyListeners();
+      }
+    }
     notifyListeners();
   }
 
