@@ -3379,3 +3379,25 @@ Task 2 DONE (f1abf1d pushed+verified). Task 1 still BLOCKED on user (plug Redmi,
 ---
 
 
+## 2026-10-06 - Flicker root-cause fix + TEST D FGS crash + 29b655f
+
+### Assistant thinking
+Flicker spec (29 sections) superseded voice test. Traced SOS UI: inline status card on SosController.status, no separate route. Root cause: main-isolate readSnapshot() read stale per-isolate SharedPreferences cache (no reload) while BG broadcasts carried live state; 1s poll overwrote active states. Fixed with reload() in readSnapshot + BG poll + native wait loop. TEST D then exposed Android 14+ FGS mic SecurityException crash (whole process died mid-SOS, SOS lost); fixed fail-open with NATIVE_DONE=failed. Verified A/B/C/D/E/G on device; F blocked (pattern lock).
+
+### Tool Input
+- flutter analyze (2 files) => No issues found. flutter build apk --debug (17.4s) + adb install -r Success + monkey launch (locked phone OK).
+- Power-button SOS re-run + 10-min soak + post-soak SOS; logcat + voice-debug.log sampling.
+- git add 3 files; commit 29b655f; git push cmfinal HEAD:main => 61946fc..29b655f; ls-remote => VERIFIED 29b655f.
+
+### Tool Output
+- TESTS A+B+C PASS: manual SOS single broadcast chain listening->cancelWindow->countdown->recording->sending->sent (case f9ca9d69), zero oscillation, PID alive.
+- TEST D crash (pre-fix): SosRecordingService.kt:115 startForeground mic-FGS from background -> SecurityException (targetSDK 36) -> FATAL -> PID 27723 died, SOS lost. Post-fix re-run 10:11:07 power trigger -> SENT case 5f8b8c40 (10:11:20), PID 6407 survived; logcat fail-open line confirms.
+- TEST E covered (locked/backgrounded throughout). TEST G PASS: 10-min soak PID stable, sostrans frozen at 16, post-soak SOS SENT case d87bd86c (10:23:05). TEST F BLOCKED: pattern lock, needs user unlock.
+- TEMP-DEBUG sostrans stripped; final clean build verified: PID 25266, boot 10:26:50 -> dashboard 10:26:57 -> ENGINE-UP listening 10:27:03, watchdog success.
+- Commit 29b655f pushed+verified on cmfinal main. Remaining: TEST F (user), final 10-section report.
+
+### Assistant metadata
+Flicker + crash work DONE and pushed. Only TEST F (rotation, needs unlock) and final report remain.
+
+---
+
