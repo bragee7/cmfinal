@@ -234,6 +234,13 @@ class SosExecutor {
   static Future<void> _poll() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      // Same cross-isolate coherency as readSnapshot: the power trigger is
+      // stashed by the native receiver and cancels arrive from the main
+      // isolate / native alarm activity. Reload so this BG-side read sees
+      // their writes instead of the boot-time cache.
+      try {
+        await prefs.reload().timeout(const Duration(seconds: 3));
+      } catch (_) {}
 
       // Power-button path: native receiver stashed a trigger while we run.
       final powerTs = prefs.getInt('zelda_power_sos_trigger');
@@ -366,6 +373,11 @@ class SosExecutor {
       SharedPreferences p;
       try {
         p = await SharedPreferences.getInstance();
+        // Native recorder + alarm activity write from outside this isolate:
+        // reload each iteration so cancel/done are seen promptly.
+        try {
+          await p.reload().timeout(const Duration(seconds: 3));
+        } catch (_) {}
       } catch (_) {
         await Future.delayed(const Duration(seconds: 1));
         continue;
@@ -568,6 +580,15 @@ class SosExecutor {
     try {
       final prefs = await SharedPreferences.getInstance()
           .timeout(const Duration(seconds: 5));
+      // Cross-isolate coherency: the BG executor (and native services)
+      // write these keys from another isolate/process-side writer while the
+      // UI reads them here every second. SharedPreferences caches per
+      // isolate, so without reload() this poll would forever return the
+      // values fetched at app start (stale 'idle') and fight the live
+      // broadcast snapshots — the SOS UI flicker. Reload from disk first.
+      try {
+        await prefs.reload().timeout(const Duration(seconds: 5));
+      } catch (_) {}
       return {
         'state': prefs.getString(stateKey) ?? 'idle',
         'remaining': prefs.getInt(remainingKey) ?? 0,

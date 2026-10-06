@@ -138,7 +138,8 @@ class SosController extends ChangeNotifier {
 
     // BG executor observer: live snapshots (BG authority) + app-recording
     // requests (open app records with CameraController for the executor).
-    _mirrorSub = VoiceGuardService.sosStateStream.listen(_applySnapshot);
+    _mirrorSub = VoiceGuardService.sosStateStream
+        .listen((snap) => _applySnapshot(snap));
     _appRecSub =
         VoiceGuardService.appRecordingRequests.listen((_) => recordForExecutor());
     _mirrorTimer?.cancel();

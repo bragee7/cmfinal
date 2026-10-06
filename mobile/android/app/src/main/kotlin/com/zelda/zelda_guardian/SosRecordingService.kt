@@ -112,7 +112,26 @@ class SosRecordingService : Service(), LifecycleOwner {
             stopSelf()
             return START_NOT_STICKY
         }
-        startForeground(NOTIF_ID, buildNotification())
+        // Android 14+ (targetSDK 34+): startForeground with a
+        // camera/microphone type throws SecurityException when the app is in
+        // the background (e.g. power-button SOS with the screen locked). An
+        // uncaught throw here kills the whole process — including the Dart BG
+        // isolate mid-SOS — so the SOS is never sent. Catch it, report
+        // NATIVE_DONE="failed" so the Dart side still sends the SOS (without
+        // evidence) instead of dying. See TEST D 2026-10-06.
+        try {
+            startForeground(NOTIF_ID, buildNotification())
+        } catch (e: SecurityException) {
+            Log.w(TAG, "startForeground denied from background — failing open so SOS still sends: ${e.message}")
+            try {
+                if (!::prefs.isInitialized) {
+                    prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                }
+                prefs.edit().putString(NATIVE_DONE, "failed").apply()
+            } catch (_: Exception) {}
+            stopSelf()
+            return START_NOT_STICKY
+        }
         registry.currentState = Lifecycle.State.STARTED
         val seconds = intent.getIntExtra(EXTRA_SECONDS, 30).coerceIn(5, 60)
         handler?.post { runRecording(seconds) }
