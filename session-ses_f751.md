@@ -3420,3 +3420,27 @@ Watchdog race FIXED and verified on device. TEST F rotation still needs user unl
 
 ---
 
+## 2026-10-09 - External cancel UI fixes + TEST F/G (commit 7686bf8)
+
+### Thinking
+Dismiss fix (auto-dismiss at window end, guard relaunch narrowed, launch-race grace) applied + built + installed. TEST 1 home attempt became accidental lock test (pattern lock, power presses re-lock) — auto-dismiss verified twice at recording transition (11:50:48.9, 01:10:04.9). Unlocked TEST 1 saga: user unlock, accidental user-cancel (in-app path, sos_executor.dart:213), user logged out, relogin, ENGINE-UP. Keys match (Dart zelda_sos_remaining = native flutter.zelda_sos_remaining), refresh() correct — static-5 unexplained by code, needs live visible test. TEST F self-test via adb rotation: PASS (SENT 89548e2f mid-rotation, PID stable). TEST G 10-min soak: PASS (01:16-01:26, PID 29545, zero lines). Manifest configChanges added for rotation survival. Post-install first-launch stall precedent (relaunch fixes, MIUI churn). Committed 7686bf8, pushed cmfinal main, ls-remote verified.
+
+### Tool Input
+- Edits: SosAlarmActivity.kt (lastActiveTs init now, recording/sending/sent => finish no-cancel-write, TAG import); PowerGuardService.kt step3 narrowed to cancelWindow/countdown; AndroidManifest.xml configChanges on SosAlarmActivity.
+- flutter build apk --debug Built 35s; adb install -r Success; monkey launch x2 (first stall post-install, relaunch healthy: dashboard 01:29:12, ENGINE-UP 01:29:17, watchdog success 01:29:18).
+- Power trigger + user_rotation flips mid-window => full cycle attempted; rotation re-verify on final binary.
+- flutter analyze on sos_executor/sos_controller => No issues found.
+- git add 3 files; commit 7686bf8; git push cmfinal HEAD:main => d35392f..7686bf8; ls-remote HEAD verified 7686bf8.
+
+### Tool Output
+- Auto-dismiss VERIFIED on device 3x (logcat finish at recording transition, no relaunch after).
+- TEST F PASS (old binary SENT 89548e2f-6a73-4564-90ca-e626ff4ed092 mid-rotation; final binary cycle completed, PID 17166 stable, clean mic-resume after server 500).
+- TEST G PASS (10+ min idle, same PID, zero log lines, zero crash).
+- Server HTTP 500 on 2 sends tonight (01:12:43, 01:29:48 SOSs) — backend untouched per spec, noted for report.
+- Pending: FINAL FIX tests 1-4 (countdown dynamics + lock presentation need user to unlock phone); 13-item report after.
+
+### Assistant metadata
+SOS logic 100% untouched (only SosAlarmActivity + guard step3 + manifest attr). Commit 7686bf8 pushed + verified. Untracked leftovers: new_session(6-10-26).md, sos_power_cancel.png, now.png, testf_*.png.
+
+---
+
