@@ -1,6 +1,7 @@
 package com.zelda.zelda_guardian
 
 import android.app.Activity
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
@@ -61,6 +62,12 @@ class SosAlarmActivity : Activity() {
     // grace window — transient prefs gaps must never unmount it.
     private var lastActiveTs = System.currentTimeMillis()
     private var lastCount = "5"
+    // One-shot guard: the window-over branch must finish exactly once.
+    // Without this the 250 ms refresher can call finish() again after a
+    // config change / slow destroy — each extra finish() is one more
+    // `f}}}` record in the task (the duplicate `auto-dismissing` logs).
+    // Display only — SOS state untouched.
+    private var windowOver = false
 
     /** Inactive states tolerated this long before closing. */
     private val INACTIVE_GRACE_MS = 8000L
@@ -92,8 +99,36 @@ class SosAlarmActivity : Activity() {
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // System-SOS style handoff: when the keyguard is a non-secure
+        // (swipe/none) lock, dismiss it behind this screen so the lock
+        // hands off to the cancel UI. On secure locks the system keeps
+        // the credential gate — never bypassed. Display only.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val km = getSystemService(KeyguardManager::class.java)
+                if (km != null && km.isKeyguardLocked) {
+                    km.requestDismissKeyguard(this, null)
+                }
+            }
+        } catch (_: Exception) {}
+
         setContentView(buildUi())
         ui.post(refresher)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Re-request the keyguard handoff: if onCreate ran while the screen
+        // was off or the activity was still behind the keyguard, the first
+        // request may not have taken effect. Same call, display only.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val km = getSystemService(KeyguardManager::class.java)
+                if (km != null && km.isKeyguardLocked) {
+                    km.requestDismissKeyguard(this, null)
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     override fun onDestroy() {
@@ -310,10 +345,14 @@ class SosAlarmActivity : Activity() {
                 // Cancel window is over — the SOS (recording/upload) continues on
                 // its own in the service/executor. This Activity is only the
                 // cancel-window display, so dismiss WITHOUT writing any cancel
-                // command and WITHOUT stopping anything.
-                Log.i(TAG, "window over (state=$state) — auto-dismissing, SOS continues")
-                isShowing = false
-                finish()
+                // command and WITHOUT stopping anything. One-shot: the 250 ms
+                // refresher must not re-finish after a config change / slow
+                // destroy (each extra finish() is a duplicate task record).
+                if (!windowOver) {
+                    windowOver = true
+                    isShowing = false
+                    finish()
+                }
             }
             else -> {
                 // Idle/listening/transient: close only once the SOS is

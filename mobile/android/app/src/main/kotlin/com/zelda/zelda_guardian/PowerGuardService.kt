@@ -141,6 +141,8 @@ class PowerGuardService : Service() {
     private var lastTickMs = 0L
     private var pendingAlarmTs = 0L
     private var dartRecordingStarted = false
+    // Last launchAlarmUi() call (launch debounce, see launchAlarmUi).
+    private var lastAlarmUiLaunchMs = 0L
 
     private fun sosPrefs() =
         getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
@@ -217,7 +219,14 @@ class PowerGuardService : Service() {
         // the window is over and the Activity dismisses itself, so it must
         // NOT be relaunched (that was a relaunch loop).
         if (dartOwns && !nativeActive) {
-            pendingAlarmTs = 0L // Dart owns this SOS; alarm consumed.
+            // Dart owns this SOS; alarm consumed.
+            pendingAlarmTs = 0L
+            // Display: an ALARM REQUESTED but Dart already owned the flow
+            // before the coordinator consumed the request — the UI may never
+            // have been shown, so launch it on window states. No auto-dismiss
+            // race: the Activity dismisses itself once recording starts, and
+            // the window-states gate below prevents any relaunch loop.
+            // Pure display — SOS state untouched.
             if (state in setOf("cancelWindow", "countdown") &&
                 !SosAlarmActivity.isShowing && !isAppForeground()) launchAlarmUi()
             return
@@ -249,6 +258,20 @@ class PowerGuardService : Service() {
     }
 
     private fun launchAlarmUi() {
+        // Launch debounce: the 500 ms coordinator can tick twice before the
+        // launched Activity's onCreate sets isShowing=true (~200-500 ms
+        // inflation). Without this, tick N launches task A and tick N+1 sees
+        // !isShowing and launches task B — the duplicate-task records
+        // (#1358/#1359) and the doubled auto-dismiss log lines. A showing
+        // Activity mirrors live prefs via refresh(), so it never needs a
+        // relaunch; the only gap this debounce must cover is inflation.
+        // 3 s is far below any genuine re-request interval. Display only.
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - lastAlarmUiLaunchMs < 3000) {
+            Log.i(TAG, "alarm UI launch debounced (already launched ${nowMs - lastAlarmUiLaunchMs} ms ago)")
+            return
+        }
+        lastAlarmUiLaunchMs = nowMs
         // Full-screen intent: the one mechanism allowed to appear over the
         // home/lock screen from the background.
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -288,6 +311,29 @@ class PowerGuardService : Service() {
                 startActivity(alarm)
             } catch (_: Exception) {}
         }
+        // System-SOS style lock handoff: an FSI posts as heads-up only
+        // when the screen is off/locked, so ALWAYS also start the activity
+        // directly (overlay permission granted by the user) and try to wake
+        // the screen. Unconditional: the instantaneous keyguard read is
+        // unreliable across power-toggle races, and a direct start is
+        // harmless when unlocked. Display plumbing only — SOS state untouched.
+        try {
+            try {
+                val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+                @Suppress("DEPRECATION")
+                pm.newWakeLock(
+                    android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                        android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
+                    "zelda:sos-alarm-wake"
+                ).apply { acquire(30000) }
+            } catch (_: Exception) {}
+            try {
+                startActivity(alarm)
+                Log.i(TAG, "alarm activity direct-started alongside FSI")
+            } catch (e: Exception) {
+                Log.w(TAG, "alarm direct start blocked: ${e.message}")
+            }
+        } catch (_: Exception) {}
     }
 
     private fun claimNativeFlow(prefs: android.content.SharedPreferences) {
