@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -33,6 +34,7 @@ import android.widget.TextView
 class SosAlarmActivity : Activity() {
 
     companion object {
+        private const val TAG = "SosAlarm"
         private const val PREFS = "FlutterSharedPreferences"
         private const val STATE = "flutter.zelda_sos_state"
         private const val REMAINING = "flutter.zelda_sos_remaining"
@@ -57,7 +59,7 @@ class SosAlarmActivity : Activity() {
     // and the last countdown number shown. This screen only closes on user
     // cancel or when the SOS has been over (inactive state) for the full
     // grace window — transient prefs gaps must never unmount it.
-    private var lastActiveTs = 0L
+    private var lastActiveTs = System.currentTimeMillis()
     private var lastCount = "5"
 
     /** Inactive states tolerated this long before closing. */
@@ -305,10 +307,13 @@ class SosAlarmActivity : Activity() {
                 subtitleText.text = "SOS sends automatically — swipe to cancel"
             }
             "recording", "sending", "sent" -> {
-                lastActiveTs = System.currentTimeMillis()
-                countText.text = "●"
-                countText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 64f)
-                subtitleText.text = "Recording evidence…"
+                // Cancel window is over — the SOS (recording/upload) continues on
+                // its own in the service/executor. This Activity is only the
+                // cancel-window display, so dismiss WITHOUT writing any cancel
+                // command and WITHOUT stopping anything.
+                Log.i(TAG, "window over (state=$state) — auto-dismissing, SOS continues")
+                isShowing = false
+                finish()
             }
             else -> {
                 // Idle/listening/transient: close only once the SOS is

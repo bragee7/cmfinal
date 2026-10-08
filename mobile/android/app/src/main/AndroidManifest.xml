@@ -70,6 +70,7 @@
             android:excludeFromRecents="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|density|uiMode"
             android:theme="@style/NormalTheme"/>
         <receiver
             android:name=".BootReceiver"

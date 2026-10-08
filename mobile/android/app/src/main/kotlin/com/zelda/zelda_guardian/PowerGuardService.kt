@@ -212,10 +212,14 @@ class PowerGuardService : Service() {
             if (cmd != "start_recording") dartRecordingStarted = false
         }
 
-        // 3. Display: active flow but alarm UI not up and app not open.
+        // 3. Display: cancel window active but alarm UI not up and app not
+        // open. Only the window states launch the UI — once recording starts
+        // the window is over and the Activity dismisses itself, so it must
+        // NOT be relaunched (that was a relaunch loop).
         if (dartOwns && !nativeActive) {
             pendingAlarmTs = 0L // Dart owns this SOS; alarm consumed.
-            if (!SosAlarmActivity.isShowing && !isAppForeground()) launchAlarmUi()
+            if (state in setOf("cancelWindow", "countdown") &&
+                !SosAlarmActivity.isShowing && !isAppForeground()) launchAlarmUi()
             return
         }
 
