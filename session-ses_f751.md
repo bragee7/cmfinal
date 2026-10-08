@@ -3444,3 +3444,31 @@ SOS logic 100% untouched (only SosAlarmActivity + guard step3 + manifest attr). 
 
 ---
 
+## 2026-10-09 - Lock-screen cancel UI fixes + TESTS 1-4 pass + push 44b57b1
+
+### Thinking
+- TEST 2 lock saga root-caused live: run 4 (app DEAD at trigger) showed full SOS UI over swipe lock, runs 5/6 (app ALIVE) showed heads-up only; run-7 acts dump (RESUMED/visible/firstWindowDrawn + Occluded=true) vs 03:03 pixel proof (lock+headsup only) = app-alive launches drew UNDER/occluded.
+- Static-5 root-caused as placeholder lastCount="5" on stale opens; live windows showed digits 5->3->1 ticking (refresh reads same remaining key the executor ticks; Dart key matches native key).
+- Duplicate task records #1358/#1359 + x4 auto-dismiss logs = tick N launches task A while tick N+1 still sees !isShowing (onCreate inflation gap).
+- Decided display-only fixes (SOS logic untouchable per spec): SYSTEM_ALERT_WINDOW manifest perm + unconditional direct-start + ACQUIRE_CAUSES_WAKEUP wake lock alongside FSI + requestDismissKeyguard (onCreate+onResume) + 3s launch debounce + windowOver one-shot auto-dismiss.
+
+### Tool Input
+- Edits: AndroidManifest.xml (+SYSTEM_ALERT_WINDOW), PowerGuardService.kt (unconditional direct-start+wake lock, 3s debounce, step-3 window-states gate kept), SosAlarmActivity.kt (requestDismissKeyguard onCreate+onResume, windowOver one-shot; TEMP-DIAG reportVisibility stripped after).
+- `flutter build apk --debug` => Built; `adb install -r` => Success.
+- TEST 2: chained trigger+screencap => t2win.png FULL SOS UI over swipe lock, digit 5 at +1.05s post-trigger (TRIGGER 03:23:22.955, countdown 03:23:27, recording 03:23:30).
+- TEST 3: screen-OFF miss lesson (verify mWakefulness=Awake first); uiautomator gave Cancel bounds [66,2103][1014,2312] ctr (540,2207) on 1080x2400; tap => CANCELLED (alarm-activity cancel) 03:26:49.994, 1.7s post-trigger, mic resumed, zero send; no keyguard nodes in hierarchy.
+- `flutter analyze` => 7 info lints (pre-existing test files), zero errors.
+- Final-binary smoke: lock-deferred boot + am-start jolt => dashboard shown 03:30:54, ENGINE-UP 03:31:00, watchdog success.
+- `git add` 3 files; commit 44b57b1; `git push cmfinal HEAD:main` => d5778e2..44b57b1; ls-remote HEAD verified 44b57b1.
+
+### Tool Output
+- TESTS 1-4 ALL PASS (home countdown mirror live; lock UI fullscreen over swipe lock; cancel-over-lock 1.7s no-send; in-app dynamics unchanged).
+- Frame-deferral finding: MainActivity foreground/top but paused behind launcher/keyguard produces no frames => dashboard init/watchdog/guard deferred; `am start` intent delivery jolts lifecycle (recovery runbook).
+- Logcat lessons: device buffer rotates ~1-2 min (pull within seconds); `logcat -c` unreliable (03:20:20 lines survived it); PowerShell mangles ERE brackets (fixed strings only); adbd echoes self-match greps (filter adbd out); PowerPressReceiver logs under TAG PowerPress.
+- Server HTTP-500 SEND FAILEDs continue (backend untouched per spec).
+
+### Assistant metadata
+SOS logic 100% untouched (3 native/display files only, no Dart changes). TEST 2/3 needed no user assist ("bro done" cue unused). Pending: 13-item FINAL FIX report.
+
+---
+
