@@ -3499,3 +3499,35 @@ SOS logic 100% untouched (fix = 1 read expression in SosAlarmActivity.kt). Untra
 
 ---
 
+## 2026-10-09 - Lock-cancel complaint + swipe fix + FGS re-promote + 41d9b95 push
+
+### Thinking
+- User: "test all by yourself but the i cant able to cancel the sos on lock screen". now_chk.png made it concrete: swipe lock + EXPANDED heads-up "ZELDA SOS TRIGGERED / Swipe to cance..." with NO Cancel affordance — heads-up swipe only auto-dismisses the notif, never cancels the SOS; the "Swipe to cancel" text is misleading.
+- Then user: "the sos cancel screen was displaying but i cant able to cancel the sos (i cant able cancel the sos by slide cancel)" — fullscreen activity DISPLAYS but the slide gesture does nothing. My adb pill TAP had worked (lock4 14:32 CANCELLED) + user's own 14:07 tap cancelled, so swipe-specific.
+- Root cause (read full SosAlarmActivity.kt 384 lines): the "Cancel" label fills the ENTIRE pill and has its own OnClickListener → Android dispatches DOWN to the clickable child first, so swipes starting on the label (95% of pill area) never reach the pill's swipe tracker; only thumb-originated (60dp) swipes moved the thumb. Tap survived via click — matches all differential evidence exactly.
+- Fix (activity-only): label isClickable=false + isFocusable=false; pill isClickable=true + contentDescription + setOnClickListener (TalkBack); unified pill touch listener — DOWN records, MOVE past slop drags thumb and cancels at >=55%, UP without move = tap-cancel, UP after drag / CANCEL = snap back.
+- Separate crash (found during user-done retest): rotation-back killed PID 1071 (FATAL ForegroundServiceDidNotStartInTimeException on BackgroundService) and PID 22109 the same way (+32s after dashboard/start both). Root cause via plugin source (flutter_background_service android 6.3.1): onCreate promotes BEFORE engine spawn but updateNotificationInfo swallows SecurityException; a background (re)start runs UNPROMOTED (ENGINE-UP still fires, watchdog passes); next startService() re-delivery re-arms the FGS timeout while runService() early-returns "already running" without re-promoting → death. Device proof: 23196's record startForegroundCount=0 while running+ENGINE-UP+mic-live (later corrected: temp-allowlist counter, not promotion state; isForeground=true is the real signal).
+- Fix (voice-engine path only, voice_guard_service.dart): start() checks isRunning() (3s timeout, fail-closed false) — already-running => fire-and-forget invoke('promote_to_foreground'), else fresh startService(); _onStart registers 'promote_to_foreground' => setAsForegroundService() + flog (idempotent heal).
+- Heads-up "Cancel SOS" action (PowerGuardService.kt): ACTION_CANCEL_ALARM + handleAlarmCancel() writes IDENTICAL command as pill (flutter.zelda_sos_command=cancel) + cancels notif 259; honored via shared path (executor "alarm-activity cancel", native guard). SosAlarmActivity.onDestroy does NOT cancel 259 => action persists into recording (extends cancelability past auto-dismiss). Action-button tap test itself still open (can't hold screen-ON at trigger via toggles); user asked to test it.
+- FSI semantics settled: screen state AT TRIGGER INSTANT decides fullscreen vs heads-up (OFF => fullscreen over lock: t2win, run-4, lock4, 14:32-run; ON => heads-up: runs-5/6, 12:23, 12:26). Toggle chains make it a coin flip — explains all intermittency. NOT a bug.
+
+### Tool Input
+- `flutter build apk --debug` => Built (11.9s swipe-fix build); `adb install -r` => Success; monkey relaunch => PID 18359; boot (authenticated=true retained) => dashboard 14:42:47 + ENGINE-UP + watchdog success; prefs Idle.
+- Swipe self-test #1 MISSED (4-press-from-OFF fired trigger on ON-toggle => heads-up mode, swipe hit lock screen). Attempt #2 3-press-from-ON (trigger lands on OFF-toggle => fullscreen): TRIGGER power 14:45:16 => CANCELLED (alarm-activity cancel) 14:45:18 (+2.2s). Swipe started x=200 = label region old code ate => clean differential proof fix works.
+- 14:44 SOS resolved clean (native done => SEND FAILED 500 server-side => mic resumed => Idle).
+- `git add` 3 files; commit 41d9b95 (PowerGuard notif-cancel + swipe fix + FGS re-promote; SOS logic untouched); `git push cmfinal HEAD:main` => 286ef2b..41d9b95; ls-remote HEAD verified 41d9b95.
+- Self-login via adb with user-provided creds (user@guardian.com / user123): uiautomator bounds, both-strings-in-email miss, MOVE_END+DEL clear, BACK-dismiss-keyboard, Sign In tap => spinner => "Enable Location Service" dialog => LOGIN SUCCEEDED (GPS off); dialog later gone, dashboard live.
+- Rotation-visible: landscape renders clean (rot5.png, no recreation — Flutter handles rotation, no startService re-arm); BACK-destroy => SAME PID relaunch => promote path lines ("service already running — requesting re-promote", "[bg] re-promoted to foreground") => isForeground=true foregroundId=256, alive +65s, FATAL grep 0. A/B vs 1071/22109 (+32s deaths) PASSES.
+- User self-testing observed mid-session (13:21 power trigger => SEND FAILED "not logged in" => session lost; 14:07 power trigger => CANCELLED alarm-activity — user's tap, TEST-3-style pass). Re-logged in via adb after.
+
+### Tool Output
+- Swipe-to-cancel VERIFIED on device (14:45:16 trigger => 14:45:18 CANCELLED). Lock-screen cancel now has THREE paths: fullscreen pill tap, fullscreen slide gesture, heads-up "Cancel SOS" action (action-tap test open, user asked).
+- FGS re-promote VERIFIED (no FATAL past crash window, isForeground=true). Rotation crash CLOSED.
+- Pending: heads-up action-button tap test (user asked) + KWS voice test (needs user voice); 13-item FINAL FIX report after.
+- Server HTTP-500s + createCase timeouts continue (backend out of scope per spec).
+
+### Assistant metadata
+SOS logic 100% untouched (3 display/voice-engine-plumbing files only: SosAlarmActivity.kt, PowerGuardService.kt, voice_guard_service.dart). Untracked leftovers: new_session(6-10-26).md, sos_power_cancel.png, testf_*.png, li*.png/xml, $TEMP screenshots.
+
+---
+
