@@ -16,6 +16,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -282,38 +283,69 @@ class SosAlarmActivity : Activity() {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
-            setOnClickListener { cancelSos() }
+            // Must NOT be clickable: a clickable full-pill child consumes
+            // DOWN before the pill's touch listener runs, which is exactly
+            // what broke swipe-to-cancel (swipes starting on the label never
+            // moved the thumb; only the tap path survived via click). All
+            // touch is owned by the pill listener below — a plain tap
+            // anywhere on the pill cancels there too.
+            isClickable = false
+            isFocusable = false
         }
         pill.addView(label)
         pill.addView(thumb)
 
+        // The pill itself is the accessible click target (TalkBack
+        // double-tap → performClick → cancel, independent of touch routing).
+        pill.isClickable = true
+        pill.contentDescription = "Cancel SOS. Activate to cancel the SOS."
+        pill.setOnClickListener { cancelSos() }
+
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
         var downX = 0f
         var dragging = false
+        var moved = false
         pill.setOnTouchListener { v, ev ->
             when (ev.action) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = ev.x
                     dragging = true
+                    moved = false
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     if (dragging) {
                         val max = (v.width - thumbSize - dp(this@SosAlarmActivity, 16)).coerceAtLeast(1)
                         val dx = (ev.x - downX).coerceIn(0f, max.toFloat())
-                        thumb.translationX = dx
-                        if (dx >= max * 0.55f) {
-                            dragging = false
-                            cancelSos()
+                        if (dx > slop) {
+                            moved = true
+                            thumb.translationX = dx
+                            if (dx >= max * 0.55f) {
+                                dragging = false
+                                cancelSos()
+                            }
                         }
                     }
                     true
                 }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                MotionEvent.ACTION_UP -> {
+                    if (dragging) {
+                        dragging = false
+                        if (!moved) {
+                            // Plain tap anywhere on the pill cancels.
+                            cancelSos()
+                        } else {
+                            thumb.animate().translationX(0f).setDuration(150).start()
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
                     dragging = false
                     thumb.animate().translationX(0f).setDuration(150).start()
                     true
                 }
-                else -> false
+                else -> true
             }
         }
         return pill

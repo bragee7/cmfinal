@@ -478,18 +478,33 @@ class VoiceGuardService {
       developer.log('mic verdict stash failed (best-effort): $e',
           name: 'VoiceGuard', level: 1000);
     }
-    // startService() on an already-running service is a harmless no-op, so
-    // re-init calls never disturb a healthy engine. A failed service is
-    // revived by toggle OFF (the 'stop' listener below is registered first
-    // thing in _onStart, so it always exists) followed by toggle ON.
+    // NEVER blindly startService(): on an already-running service the
+    // re-delivery re-arms the system's FGS timeout while the plugin's
+    // runService() early-returns ("already running") WITHOUT re-promoting.
+    // If that service lost foreground state (background restart ⇒ mic-FGS
+    // promotion denied, exception swallowed by the plugin), the process
+    // dies ~30 s later with ForegroundServiceDidNotStartInTimeException.
+    // So: fresh start only when down; when already up, ask the live BG
+    // isolate to re-promote itself (app is foreground here ⇒ allowed).
     // Stamp the boot attempt so the watchdog can tell "isolate never ran"
     // apart from "isolate died mid-boot" (BG stamps overwrite this).
     await markStage('main-start');
-    // startService() itself is NOT optional — it must always run so the
+    // startService() itself is NOT optional when down — it must run so the
     // watchdog below can verify the engine actually started.
-    await flog('main', 'calling startService()');
-    await _service.startService().timeout(const Duration(seconds: 15));
-    await flog('main', 'startService() returned');
+    final alreadyRunning = await _service
+        .isRunning()
+        .timeout(const Duration(seconds: 3))
+        .catchError((_) => false);
+    if (alreadyRunning) {
+      await flog('main', 'service already running — requesting re-promote');
+      try {
+        _service.invoke('promote_to_foreground');
+      } catch (_) {}
+    } else {
+      await flog('main', 'calling startService()');
+      await _service.startService().timeout(const Duration(seconds: 15));
+      await flog('main', 'startService() returned');
+    }
 
     // Watchdog: the dashboard toggle used to stay fake-ON when the native
     // service never came up. Wait for the engine-up signal (statusEvent
@@ -737,6 +752,28 @@ Future<void> _onStart(ServiceInstance service) async {
     kwsStream?.free();
     spotter?.free();
     service.stopSelf();
+  });
+
+  // Re-promote to foreground on request from the main isolate. A service
+  // (re)started while the app is in the background is denied mic|location
+  // FGS promotion (SecurityException, swallowed by the plugin) yet keeps
+  // running unpromoted: engine boots, ENGINE-UP fires, watchdog passes —
+  // but the next startService() re-delivery re-arms the system's FGS
+  // timeout while runService() early-returns without re-promoting, and the
+  // process dies ~30 s later with ForegroundServiceDidNotStartInTime
+  // (killed PIDs 1071/22109 on rotation-recreate/app-reopen). The main
+  // isolate sends this only when it finds the service already running; the
+  // app is foreground then, so startForeground() is allowed and heals the
+  // service back to full FGS protection. Idempotent — safe to repeat.
+  service.on('promote_to_foreground').listen((_) async {
+    try {
+      if (service is AndroidServiceInstance) {
+        await service.setAsForegroundService();
+        await VoiceGuardService.flog('bg', 're-promoted to foreground');
+      }
+    } catch (e) {
+      await VoiceGuardService.flog('bg', 're-promote failed: $e');
+    }
   });
 
   // The main isolate asks for the CURRENT running state on every start():

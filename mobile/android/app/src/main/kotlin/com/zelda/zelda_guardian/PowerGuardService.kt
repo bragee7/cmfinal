@@ -31,6 +31,10 @@ class PowerGuardService : Service() {
         private const val NOTIF_ID = 258
         const val ACTION_TRIGGER = "com.zelda.zelda_guardian.POWER_SOS_TRIGGER"
         private const val ALARM_NOTIF_ID = 259
+        // Heads-up/lock-screen Cancel button action. Writes the IDENTICAL
+        // command the SosAlarmActivity Cancel pill writes; honored through
+        // the shared cancel path. Display plumbing only.
+        private const val ACTION_CANCEL_ALARM = "com.zelda.zelda_guardian.SOS_ALARM_CANCEL"
 
         fun start(context: Context) {
             val intent = Intent(context, PowerGuardService::class.java)
@@ -74,7 +78,43 @@ class PowerGuardService : Service() {
         if (intent?.action == "com.zelda.zelda_guardian.POWER_SOS_TRIGGER") {
             postAlarmNotification()
         }
+        if (intent?.action == ACTION_CANCEL_ALARM) {
+            handleAlarmCancel()
+            return START_STICKY
+        }
         return START_STICKY
+    }
+
+    // Lock-screen / heads-up Cancel button. Writes the IDENTICAL command
+    // the SosAlarmActivity Cancel pill writes
+    // (FlutterSharedPreferences flutter.zelda_sos_command = "cancel"), so the
+    // Dart executor poll and native driveFlow honor it through the shared
+    // cancel path. Also withdraws the alarm notification. Display plumbing
+    // only — SOS state machine untouched.
+    private fun handleAlarmCancel() {
+        try {
+            sosPrefs().edit().putString("flutter.zelda_sos_command", "cancel").apply()
+            Log.i(TAG, "alarm Cancel action tapped — wrote command=cancel")
+        } catch (e: Exception) {
+            Log.w(TAG, "alarm cancel write failed: ${e.message}")
+        }
+        try {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .cancel(ALARM_NOTIF_ID)
+        } catch (_: Exception) {}
+    }
+
+    private fun alarmCancelPi(): PendingIntent {
+        val cancel = Intent(this, PowerGuardService::class.java).apply {
+            action = ACTION_CANCEL_ALARM
+        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(this, 3, cancel, flags)
+        } else {
+            @Suppress("DEPRECATION")
+            PendingIntent.getService(this, 3, cancel, flags)
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -300,6 +340,11 @@ class PowerGuardService : Service() {
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setFullScreenIntent(pi, true)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Cancel SOS",
+                alarmCancelPi()
+            )
             .setAutoCancel(true)
             .build()
         try {
@@ -520,6 +565,11 @@ class PowerGuardService : Service() {
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setFullScreenIntent(pi, true)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Cancel SOS",
+                alarmCancelPi()
+            )
             .setAutoCancel(true)
             .build()
         try {
