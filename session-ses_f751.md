@@ -3472,3 +3472,30 @@ SOS logic 100% untouched (3 native/display files only, no Dart changes). TEST 2/
 
 ---
 
+## 2026-10-09 - REAL static-5 root cause (Long vs Int) + fix + tick proof + push bfc5e34
+
+### Thinking
+- pc1.png showed activity digit 5 at ~+4s post-trigger — too high for a live window (should read ~1-2). Reopened static-5 despite earlier "refuted" verdict.
+- Code truth: SosAlarmActivity.refresh() used prefs.getInt(REMAINING); Flutter's SharedPreferences plugin stores Dart setInt as Long (putLong), so getInt throws ClassCastException on Dart-written values — caught by the try/catch → 0 → "keep last number" branch → digit frozen at initial "5" in ALL Dart-driven flows (sos_executor.dart:181/267/276/298 write remaining via setInt).
+- Explains mixed history perfectly: native guard driveNativeFlow writes putInt (PowerGuardService.kt) so native-owned flows ticked (lived.png 3, livee.png 1 sightings); Dart-owned flows froze at 5; stale opens also show placeholder 5. Earlier "refuted" verdict was built on in-app + native-flow sightings — wrong.
+- Fix is activity-only read change (spec-compliant): prefs.all[REMAINING] with type-tolerant when (Number→toInt, String→toIntOrNull, else 0). Zero SOS-logic change.
+
+### Tool Input
+- Edit: SosAlarmActivity.kt refresh() remaining read only (+comment, 9 insertions 1 deletion).
+- `flutter build apk --debug` => Built; `adb install -r` => Success (app dead post-install — pidof empty; relaunched via monkey PID 1071 + am-start jolt => ENGINE-UP 11:03:22 + watchdog success).
+- Tick-test attempt 1: screen timed out to OFF before chain, 4 toggles ended OFF, pc3.png black — lesson: verify screen ON immediately before chains (stale checks lie); use `input keyevent 224` WAKEUP-first.
+- Tick proof via uiautomator dumps (no screenshot race): dump A in-window caught live activity texts with digit "1" CORRECT for late-window (frozen-5 bug would show "5"); dump B post-window shows lock + FSI heads-up only (windowOver auto-dismiss + narrowed step3, no relaunch). Combined with pc1.png "5" at trigger+1s: 5→1 live tick PROVEN across runs.
+- Screen-OFF parity trap re-hit on pc4 (first press after 224-wake gets eaten → odd toggles → ends OFF); lesson: end chains with explicit WAKEUP before capture, or prefer dumps over screenshots.
+- Rotation test at Idle (final binary): PID 1071 alive, prefs zelda_sos_state=idle after rotation change; rot1.png shows lock screen + lingering FSI heads-up "2m" (alarm notif persists post-SOS — cosmetic note, not chased per constraints). Settings restored (accelerometer_rotation=1).
+- `flutter analyze` => 7 info lints (pre-existing), zero errors.
+- `git add` SosAlarmActivity.kt; commit bfc5e34; `git push cmfinal HEAD:main` => f6f78da..bfc5e34; ls-remote HEAD verified bfc5e34.
+
+### Tool Output
+- Retest status ("re test again check all the features"): boot health PERFECT (dashboard 10:45:31, ENGINE-UP 10:45:40, watchdog success, toggles ON, GPS fix); manual SOS live window digit 3; SOS #1/#2/#3 full cycles all send-attempted (HTTP-500s + one 3-min createCase Timeout — all server-side, backend out of scope); external cancel path re-proven (CANCELLED alarm-activity 1.7s); countdown tick fix verified on-device.
+- Pending: rotation-visible test + lock test + KWS voice (all need user unlock/assist); 13-item FINAL FIX report after.
+
+### Assistant metadata
+SOS logic 100% untouched (fix = 1 read expression in SosAlarmActivity.kt). Untracked leftovers: new_session(6-10-26).md, sos_power_cancel.png, testf_*.png, $TEMP screenshots.
+
+---
+
