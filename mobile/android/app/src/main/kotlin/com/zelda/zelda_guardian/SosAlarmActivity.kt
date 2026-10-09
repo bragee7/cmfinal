@@ -325,8 +325,16 @@ class SosAlarmActivity : Activity() {
         val state = try {
             prefs.getString(STATE, "idle") ?: "idle"
         } catch (_: Exception) { "idle" }
+        // remaining is written as Long by Flutter's SharedPreferences plugin
+        // (Dart setInt → putLong) but as Int by the native drive flow
+        // (putInt). getInt throws ClassCastException on a Long entry, which
+        // used to freeze the digit at its initial "5" — read type-tolerantly.
         val remaining = try {
-            prefs.getInt(REMAINING, 0)
+            when (val v = prefs.all[REMAINING]) {
+                is Number -> v.toInt()
+                is String -> v.toString().toIntOrNull() ?: 0
+                else -> 0
+            }
         } catch (_: Exception) { 0 }
 
         when (state) {
