@@ -3531,3 +3531,19 @@ SOS logic 100% untouched (3 display/voice-engine-plumbing files only: SosAlarmAc
 
 ---
 
+## 2026-10-12 - Wave-1 audit fixes + logout-protection-down + engine-revive (e37d879)
+
+### Thinking
+8 parallel fix agents (user: "fix everything... in a loop") all completed clean. Integration: dashboard parallel-edit overlap verified safe (both agents' markers present), orphan sound_detector_test deleted, splash police-branch nav fixed, full analyze clean. Device loop on wave-1 build: promote-path PASS, SOS send routing PASS (500 proves /api hit, Render runs old server), contacts add/delete PASS, alerts-history + case-details PASS, lens switch PASS, trigger-words save/restore PASS, logout PASS, register UI PASS, rotation PASS. Found critical logout→login protection-down bug (logout cleared prefs, nothing restored; engine dead while UI claimed Active) + deeper start-after-stop engine-never-reboots hole (standby isolate + `if (running) return`). Fixed via prelogout stash/restore + boot_engine re-boot handler + auto-start heal. Verified end-to-end: logout→login→ENGINE-UP 14:19:19 + watchdog success, toggle off/on round-trip, prefs+UI consistent.
+
+### Tool input/output
+- `flutter build apk --debug`: build-env fixed first (stale package_config.json C:/flutter → `flutter pub get`; EXIT 0). Wave-1 rebuild 21.7s OK; revive rebuild 18.3s OK. `flutter analyze`: No issues found (full tree).
+- `adb install -r` Success x3 (PIDs 18031, 924, 17132). Device tests: BACK-destroy same-PID no-crash; manual SOS TRIGGER→recording→500(send-failed, routing proven); contacts add (POST) + delete-confirm (DELETE); alerts list real cases (#89548e2f, #93ddd5d7); case details renders; Front lens selected; trigger words saved+restored; logout→login screen; register screen UI-only.
+- Login-restore proof: stash verified in prefs (prelogout=true), post-login rawPref=true, ENGINE-UP listening 14:19:19, boot_engine already-up guard on fresh boot, toggle OFF teardown + ON fresh-boot revival.
+- `git commit e37d879` (21 files, 759+/549-); `git push cmfinal HEAD:main` → fc758af..e37d879; `git ls-remote cmfinal HEAD` VERIFIED at e37d879.
+
+### Assistant metadata
+Wave-1 (19 files): session hardening, boot-resync, SOS edges, contacts/alerts/details fixes, dead-code removal, backend fail-open/auth hardening. Login-restore + engine-revive (4 files): prelogout stash, restore-on-login, boot_engine handler, auto-start heal. SOS lifecycle transitions unchanged. Backend fixes LOCAL (server/) — phone hits Render deploy; live backend proof needs deploy. Still open (need user): KWS voice (say "help me"), lock-screen taps, notif Cancel-action tap. Untracked leftovers add: li9-li21.png, lo*.xml, dash*.xml, rot6.png, jolt.png, lens.png, li*.png.
+
+---
+
