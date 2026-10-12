@@ -3561,3 +3561,17 @@ KWS proven in all lock states on-device; watchdog is defense-in-depth for flaky 
 
 ---
 
+## 2026-10-12 - KWS cooldown 1s + behavioral proof + commit 77f1dbc
+
+User: "remove the cool down time or reduce the cool down time to 1 second do it".
+Cooldown = exactly ONE mechanism: `_dedupeWindow` (voice_guard_service.dart:104, was 2s). No other KWS cooldown exists (resetDetectionCooldown only clears timestamps; executor reset_cooldown listener is a no-op comment).
+Fix: 2s to 1s + comment (keeps same-utterance double-fire protection; full removal rejected as riskier). Discovered both fireKeyword lines use developer.log ONLY (never reach voice log or logcat — proven: TRIGGER 16:28:25 fired yet immediate logcat keyword grep came back empty) → added flog() to dedupe-blocked + confirmed lines: diagnostic only, zero behavior change. Analyze clean (phantom LSP EOF errors again, ground truth clean).
+Behavioral proof (cool rebooted phone): double-speaks kept merging (post-fire stream reset eats 2nd utterance) → switched to 6-rapid-speaks counting: SIX "Keyword confirmed" flogs (00:57:03.5, 05.4, 07.3, 09.3, 10.9, 13.1) + ZERO "dedupe-blocked" + ONE TRIGGER (single-flight holds, rest busy-silenced). Inter-fire gaps 1.919/1.913/1.924/1.601/2.239 — four sub-2.0s gaps impossible under old 2s dedupe. 1s PROVEN on-device.
+Side sagas: thermal/load (CPU 52C, skin 46 throttling, RAM 99%, 2.2GB swap after 6+ hrs testing) explained deaf windows; reboot cooled to 29C. Zero-energy-mic episode (sumSq=0.0 exact at perfect cadence) recovered on foregrounding (OS bg-capture mute lifted); chunk-count watchdog passes zero-energy streams — future hardening candidate (energy trigger).
+- `git commit 77f1dbc` (voice_guard_service.dart, 7+/1-); `git push cmfinal HEAD:main` → 81553ec..77f1dbc; `git ls-remote cmfinal HEAD` VERIFIED at 77f1dbc.
+
+### Assistant metadata
+1s cooldown done + behaviorally proven as user demanded. Commit queue empty. Still open (need user): say "help me" live for their-voice check, lock-screen taps, notif Cancel-action tap. SOS lifecycle transitions unchanged throughout.
+
+---
+
