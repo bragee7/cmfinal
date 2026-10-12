@@ -101,7 +101,8 @@ class VoiceGuardService {
   /// Dedupe window: stops the SAME utterance from firing twice (spotter
   /// emits the hit on consecutive frames of one "help me"). A new utterance
   /// after this window, or after a cancel/reset, triggers again with no limit.
-  static const _dedupeWindow = Duration(seconds: 2);
+  /// (User-requested 1s: a repeated "help me" re-triggers almost immediately.)
+  static const _dedupeWindow = Duration(seconds: 1);
 
   static const _enabledPrefKey = 'zelda_voice_guard_enabled';
   static const _triggerWordsPrefKey = 'zelda_trigger_words';
@@ -1039,11 +1040,16 @@ Future<void> _onStart(ServiceInstance service) async {
           'Keyword "$keyword" already triggered recently, ignoring',
           name: 'VoiceGuard',
         );
+        await VoiceGuardService.flog(
+          'bg',
+          'keyword dedupe-blocked: $keyword (window=${VoiceGuardService._dedupeWindow.inSeconds}s)',
+        );
         return;
       }
       VoiceGuardService._lastTriggeredAt = now;
       VoiceGuardService._lastTriggeredKeyword = keyword;
       developer.log('Keyword confirmed: $keyword', name: 'VoiceGuard');
+      await VoiceGuardService.flog('bg', 'Keyword confirmed: $keyword');
       // BG executor is authoritative: the 5s cancel window starts HERE, in
       // this isolate, whether the app is open or not.
       unawaited(SosExecutor.onTrigger('voice:$keyword'));
