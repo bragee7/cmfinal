@@ -871,16 +871,63 @@ Future<void> _onStart(ServiceInstance service) async {
   // Same downstream path as before: dedupe + pending-trigger +
   // full-screen alarm in fireKeyword, so app-off hits still wake the phone.
   var engineBooting = false;
+  // Mic-health telemetry + stall watchdog (permanent). Chunk counters and
+  // window energy, written by the mic chunk loop and read by the 10s
+  // heartbeat (both capture this scope; declared here so all users come
+  // after in source order). If the stream delivers zero chunks for 2
+  // consecutive heartbeats while the engine is listening (not paused by the
+  // executor for native recording), the heartbeat restarts it — self-heals
+  // a silently-dead AudioRecord (seen once: deaf-when-locked on a single
+  // anomalous boot while healthy everywhere else).
+  int diagChunks = 0;
+  double diagSumSq = 0.0;
+  int diagSamples = 0;
+  int diagLastChunkMs = 0;
+  bool micPausedByExecutor = false;
+  bool micEverChunked = false;
+  int micSilentBeats = 0;
+  int micStallRestarts = 0;
   // Engine boot, re-runnable on demand (see the boot_engine handler at the
   // end of this function): after a stop() teardown the isolate may stay
   // alive engine-down (a system reboot lands it in STANDBY and the standby
   // path never boots the engine), so start()/auto-start heal it through
   // here instead of only re-promoting. Returns true when the engine is up.
-  Future<bool> bootEngine() async {
-    if (engineRunning) {
+  Future<bool> bootEngine({bool force = false}) async {
+    if (engineRunning && !force) {
       await VoiceGuardService.flog('bg', 'boot_engine: already up');
       service.invoke(VoiceGuardService._statusEvent, {'running': true});
       return true;
+    }
+    if (force && engineRunning) {
+      // Stall watchdog: engine alive but mic stream silent — tear down the
+      // audio path (mirrors the stop-handler teardown, minus stopSelf) and
+      // fall through to the full boot flow below (cached bundle: fast).
+      // Uses only _onStart-scope state (all declared above this function).
+      if (engineBooting) {
+        await VoiceGuardService.flog(
+            'bg', 'boot_engine: boot already in progress, skip force');
+        return false;
+      }
+      await VoiceGuardService.flog('bg',
+          'mic STALL: no chunks for 20s+, rebooting engine (attempt $micStallRestarts)');
+      try {
+        await pcmSub?.cancel();
+      } catch (_) {}
+      pcmSub = null;
+      if (recorder != null) {
+        try {
+          await recorder?.stop();
+        } catch (_) {}
+      }
+      try {
+        kwsStream?.free();
+      } catch (_) {}
+      kwsStream = null;
+      try {
+        spotter?.free();
+      } catch (_) {}
+      spotter = null;
+      engineRunning = false;
     }
     if (engineBooting) {
       await VoiceGuardService.flog(
@@ -1064,13 +1111,19 @@ Future<void> _onStart(ServiceInstance service) async {
     // loop (fired unawaited). The spot is reset on every hit so the SAME
     // utterance cannot re-fire on consecutive frames.
     pcmSub = pcm.listen((List<int> c) {
+      diagChunks++;
+      micEverChunked = true;
+      diagLastChunkMs = DateTime.now().millisecondsSinceEpoch;
       final Uint8List chunk = c is Uint8List ? c : Uint8List.fromList(c);
       final int n = chunk.length ~/ 2;
       final Float32List samples = Float32List(n);
       for (int i = 0; i < n; i++) {
         int v = chunk[2 * i] | (chunk[2 * i + 1] << 8);
         if (v >= 32768) v -= 65536;
-        samples[i] = v / 32768.0;
+        final double s = v / 32768.0;
+        samples[i] = s;
+        diagSumSq += s * s;
+        diagSamples++;
       }
       final spot = spotter;
       final stream = kwsStream;
@@ -1092,7 +1145,16 @@ Future<void> _onStart(ServiceInstance service) async {
       return true;
     }
 
-    SosExecutor.bindMicHooks(onPause: stopMicLoop, onResume: startMicLoop);
+    SosExecutor.bindMicHooks(
+      onPause: () async {
+        micPausedByExecutor = true;
+        await stopMicLoop();
+      },
+      onResume: () async {
+        await startMicLoop();
+        micPausedByExecutor = false;
+      },
+    );
     if (!await startMicLoop()) return false;
 
     debugPrint('VoiceGuard KWS engine started, listening');
@@ -1128,6 +1190,31 @@ Future<void> _onStart(ServiceInstance service) async {
 
   Timer.periodic(const Duration(seconds: 10), (_) {
     service.invoke('heartbeat');
+    // Mic-health telemetry (cheap, 1 line/10s — proved its worth twice).
+    final int nowMs = DateTime.now().millisecondsSinceEpoch;
+    final int ageMs = diagLastChunkMs == 0 ? -1 : nowMs - diagLastChunkMs;
+    unawaited(VoiceGuardService.flog('bg',
+        'mic-health chunks=$diagChunks samples=$diagSamples sumSq=$diagSumSq lastChunkAgeMs=$ageMs'));
+    // Stall watchdog: a live-but-silent stream (zero chunks while listening,
+    // never while executor-paused for native recording) gets restarted.
+    // Arms only after the stream proved healthy once; capped at 3 restarts
+    // per boot to avoid a hot loop on a permanently-dead mic.
+    if (micPausedByExecutor) {
+      micSilentBeats = 0;
+    } else if (diagChunks > 0) {
+      micSilentBeats = 0;
+      micStallRestarts = 0;
+    } else {
+      micSilentBeats++;
+      if (micSilentBeats >= 2 && micEverChunked && micStallRestarts < 3) {
+        micStallRestarts++;
+        micSilentBeats = 0;
+        unawaited(bootEngine(force: true));
+      }
+    }
+    diagChunks = 0;
+    diagSumSq = 0.0;
+    diagSamples = 0;
   });
 }
 
