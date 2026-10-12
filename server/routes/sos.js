@@ -31,7 +31,9 @@ const upload = multer({
     if (allowedMime.test(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Only video and audio files are allowed'));
+      const err = new Error('Only video and audio files are allowed');
+      err.status = 400;
+      cb(err);
     }
   }
 });
@@ -41,7 +43,9 @@ const handleMulterError = (err, req, res, next) => {
     return res.status(400).json({ error: `Upload error: ${err.message}` });
   }
   if (err) {
-    return res.status(500).json({ error: `Upload error: ${err.message}` });
+    // fileFilter rejections (e.g. non-video/audio) carry status 400; unknown upload errors stay 500
+    const status = err.status === 400 || err.statusCode === 400 || err.message === 'Only video and audio files are allowed' ? 400 : 500;
+    return res.status(status).json({ error: `Upload error: ${err.message}` });
   }
   next();
 };
@@ -68,25 +72,37 @@ const uploadMedia = async (file) => {
     sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
   } catch (_) {}
 
-  const { error } = await supabase.storage
-    .from(MEDIA_BUCKET)
-    .upload(fileName, fs.createReadStream(file.path), {
-      contentType: file.mimetype,
-      upsert: false,
-      duplex: fileSize > 0 ? 'half' : undefined
-    });
-
+  // Fail-OPEN: a storage blip must never lose a victim alert — log + return null so the SOS case is still created.
   try {
-    fs.unlink(file.path, () => {});
-  } catch (_) {}
+    const { error } = await supabase.storage
+      .from(MEDIA_BUCKET)
+      .upload(fileName, fs.createReadStream(file.path), {
+        contentType: file.mimetype,
+        upsert: false,
+        duplex: fileSize > 0 ? 'half' : undefined
+      });
 
-  if (error) throw error;
+    try {
+      fs.unlink(file.path, () => {});
+    } catch (_) {}
 
-  const { data } = supabase.storage
-    .from(MEDIA_BUCKET)
-    .getPublicUrl(fileName);
+    if (error) {
+      console.error('[sos] media upload failed (fail-open, case still created):', error.message || error);
+      return null;
+    }
 
-  return { publicUrl: data.publicUrl, sha256 };
+    const { data } = supabase.storage
+      .from(MEDIA_BUCKET)
+      .getPublicUrl(fileName);
+
+    return { publicUrl: data.publicUrl, sha256 };
+  } catch (err) {
+    console.error('[sos] media upload threw (fail-open, case still created):', err && err.message ? err.message : err);
+    try {
+      fs.unlink(file.path, () => {});
+    } catch (_) {}
+    return null;
+  }
 };
 
 const notifySOS = async (caseForEmail, videoUrl, audioUrl, userId) => {
@@ -315,7 +331,7 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/test-email', async (req, res) => {
+router.get('/test-email', authMiddleware, async (req, res) => {
   try {
     const result = await emailService.sendTestEmail();
     if (result.success) {

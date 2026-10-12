@@ -26,8 +26,14 @@ const db = {
   ssl: config.DB_SSL !== 'false' && (process.env.DB_SSL !== 'false')
 };
 
+const configuredJwtSecret = config.JWT_SECRET || process.env.JWT_SECRET || '';
+
+if (process.env.NODE_ENV === 'production' && !configuredJwtSecret) {
+  throw new Error('FATAL: JWT_SECRET must be set in production (NODE_ENV=production). Refusing to start with default secret.');
+}
+
 const jwt = {
-  secret: config.JWT_SECRET || process.env.JWT_SECRET || 'women-safety-guardian-secret-key-2024'
+  secret: configuredJwtSecret || 'women-safety-guardian-secret-key-2024'
 };
 
 const email = {
@@ -74,8 +80,8 @@ const validateConfig = () => {
     warnings.push('Supabase not fully configured - media uploads will be disabled');
   }
 
-  if (!jwt.secret) {
-    warnings.push('JWT secret not configured, using default');
+  if (!configuredJwtSecret) {
+    warnings.push('JWT secret not configured, using default (dev only — production refuses to start)');
   }
 
   if (!email.user || !email.pass) {

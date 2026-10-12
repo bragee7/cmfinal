@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:audioplayers/audioplayers.dart';
@@ -6,12 +7,14 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
 import '../core/theme.dart';
 import '../core/widgets.dart';
 import '../models/emergency_contact.dart';
+import '../services/power_sos_service.dart';
 import '../services/voice_guard_service.dart';
 import '../state/auth_provider.dart';
 import '../state/contacts_provider.dart';
@@ -26,7 +29,7 @@ class UserDashboardScreen extends StatefulWidget {
 }
 
 class _UserDashboardScreenState extends State<UserDashboardScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   late final AnimationController _glowController;
   late final Animation<double> _glow;
 
@@ -52,31 +55,116 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
     _glow = Tween<double>(begin: 0.4, end: 1.0).animate(
       CurvedAnimation(parent: _glowController, curve: Curves.easeInOut),
     );
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<SosController>().init();
-      context.read<ContactsProvider>().fetchContacts();
-      _maybeAutoStartVoice();
-      VoiceGuardService.consumePendingTrigger();
+      _boot();
     });
+  }
+
+  /// Ordered boot: await controller init (prefs/services read) BEFORE the
+  /// voice auto-start check, so the check sees live state instead of stale
+  /// defaults. No SOS trigger/countdown/cancel/recording/send path changed.
+  Future<void> _boot() async {
+    try {
+      await context.read<SosController>().init();
+    } catch (_) {}
+    if (!mounted) return;
+    await _resyncSwitches();
+    if (!mounted) return;
+    // ignore: use_build_context_synchronously
+    context.read<ContactsProvider>().fetchContacts();
+    await _maybeAutoStartVoice();
+    await VoiceGuardService.consumePendingTrigger();
+  }
+
+  /// Resync switch UI from actual prefs/services state. Power has no status
+  /// stream, so a stale controller value (e.g. Off while pref is true after
+  /// an early-returned init) is corrected via the existing setter (idempotent
+  /// pref + native write, no SOS flow touched). Voice is read-only here: ask
+  /// the live engine to re-emit running state and let the controller's
+  /// statusStream listener correct the toggle — never start/stop here.
+  Future<void> _resyncSwitches() async {
+    try {
+      final actualPower = await PowerSosService.isEnabled();
+      if (!mounted) return;
+      // ignore: use_build_context_synchronously
+      final sos = context.read<SosController>();
+      if (sos.powerSosEnabled != actualPower) {
+        await VoiceGuardService.flog(
+          'dashboard',
+          'resync power switch UI: controller=${sos.powerSosEnabled} actual=$actualPower',
+        );
+        await sos.setPowerSosEnabled(actualPower);
+      }
+      // Voice toggle self-corrects via SosController's statusStream; just
+      // re-query so a pre-subscribe ENGINE-UP is not lost on resume.
+      VoiceGuardService.serviceInvoke('query_status');
+    } catch (_) {}
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _resyncSwitches();
+    }
+  }
+
+  /// Presentation-layer copy fix: the controller/executor report a generic
+  /// "check your connection" string for ALL send failures, including server
+  /// 5xx where the phone's connection is fine. Rewrite to neutral wording
+  /// that is accurate for both cases. Same AppBanner widget, no flow change.
+  String _displayError(String raw) {
+    if (raw.contains('check your connection')) {
+      return 'Could not send emergency alert. Please try again. '
+          'If it keeps failing, check your connection or try again later.';
+    }
+    return raw;
   }
 
   Future<void> _maybeAutoStartVoice() async {
     final user = context.read<AuthProvider>().user;
     if (user == null || user.role == 'police') return;
-    if (context.read<SosController>().voiceEnabled) return;
-
-    final mic = await Permission.microphone.request();
-    await Permission.notification.request();
+    // Heal ACTUAL state, not just the flag: the engine may be dead while the
+    // flag reads ON (e.g. logout cleared prefs), or the flag may be stale
+    // while the engine runs. The statusStream listener self-corrects the flag
+    // when running, so only a dead engine needs action here.
+    final running = await VoiceGuardService.isRunning();
     if (!mounted) return;
-    if (mic.isGranted) {
-      await context.read<SosController>().setVoiceEnabled(true);
-    } else if (await VoiceGuardService.wasEnabled()) {
-      await VoiceGuardService.restartIfNeeded();
+    final rawPref = await VoiceGuardService.getEnabledPrefRaw();
+    if (!mounted) return;
+    // ignore: use_build_context_synchronously
+    final controllerOn = context.read<SosController>().voiceEnabled;
+    await VoiceGuardService.flog('dashboard',
+        'auto-start check: running=$running rawPref=$rawPref flag=$controllerOn');
+    if (running) {
+      // Heal: a live isolate may be engine-down (a post-stop reboot lands in
+      // STANDBY and never boots the engine). Boot unless explicitly off; the
+      // handler no-ops (re-affirms status) when the engine is already up.
+      if (rawPref == null || rawPref) {
+        await VoiceGuardService.flog('dashboard',
+            'auto-start: service alive, requesting engine boot check');
+        VoiceGuardService.serviceInvoke('boot_engine');
+      }
+      return;
+    }
+    // Start unless the user EXPLICITLY disabled voice (pref false AND flag
+    // off). Covers fresh install (null), login-restore (true), and the
+    // stale-flag heal case (flag on, engine dead).
+    if (rawPref == null || rawPref || controllerOn) {
+      final mic = await Permission.microphone.request();
+      await Permission.notification.request();
+      if (!mounted) return;
+      if (mic.isGranted) {
+        await context.read<SosController>().setVoiceEnabled(true);
+      } else if (await VoiceGuardService.wasEnabled()) {
+        await VoiceGuardService.restartIfNeeded();
+      }
     }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _glowController.dispose();
     _nameController.dispose();
     _phoneController.dispose();
@@ -84,9 +172,22 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
     super.dispose();
   }
 
+  /// Stashes the EFFECTIVE protection state before logout clears it, so
+  /// login can restore the user's choice (fresh installs default to ON).
+  Future<void> _stashProtectionPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final voiceRaw = await VoiceGuardService.getEnabledPrefRaw();
+      await prefs.setBool(VoiceGuardService.preLogoutKey, voiceRaw ?? true);
+      await prefs.setBool(
+          PowerSosService.preLogoutKey, await PowerSosService.isEnabled());
+    } catch (_) {}
+  }
+
   Future<void> _handleLogout(BuildContext context) async {
     final sos = context.read<SosController>();
     final auth = context.read<AuthProvider>();
+    await _stashProtectionPrefs();
     await sos.setVoiceEnabled(false);
     await sos.setPowerSosEnabled(false);
     await auth.logout();
@@ -193,7 +294,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to save contact')),
+        SnackBar(content: Text('Failed to save contact: $e')),
       );
     }
   }
@@ -217,13 +318,27 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
       ),
     );
     if (confirmed == true) {
-      await contacts.remove(id);
+      if (!mounted) return;
+      try {
+        await contacts.remove(id);
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to delete contact: $e')),
+        );
+      }
     }
   }
 
   Future<void> _saveFile(String path, String label) async {
     final file = File(path);
-    if (!await file.exists()) return;
+    if (!await file.exists()) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Recording file not found on this device')),
+      );
+      return;
+    }
     await SharePlus.instance.share(
       ShareParams(
         files: [XFile(path, mimeType: 'video/mp4')],
@@ -274,7 +389,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
                         const SizedBox(height: 16),
                         if (sos.error.isNotEmpty) ...[
                           AppBanner(
-                            message: sos.error,
+                            message: _displayError(sos.error),
                             isError: true,
                             onDismiss: sos.dismissError,
                           ),
@@ -976,6 +1091,21 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
           ),
           const SizedBox(height: 12),
           if (_showAddContact) _buildContactForm(contacts),
+          if (contacts.error.isNotEmpty) ...[
+            AppBanner(
+              message: contacts.error,
+              isError: true,
+              onDismiss: contacts.dismissError,
+            ),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: OutlinedButton.icon(
+                onPressed: contacts.isLoading ? null : contacts.fetchContacts,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Retry'),
+              ),
+            ),
+          ],
           if (contacts.isLoading)
             const Padding(
               padding: EdgeInsets.all(24),
@@ -1626,9 +1756,10 @@ class _VideoPreviewState extends State<_VideoPreview> {
     super.initState();
     _controller = VideoPlayerController.file(File(widget.path));
     _controller!.initialize().then((_) {
-      if (mounted) setState(() {});
+      if (!mounted) return;
       _controller!.setLooping(true);
-    });
+      setState(() {});
+    }, onError: (_) {});
   }
 
   @override
@@ -1690,21 +1821,23 @@ class _AudioPreview extends StatefulWidget {
 
 class _AudioPreviewState extends State<_AudioPreview> {
   final AudioPlayer _player = AudioPlayer();
+  StreamSubscription<PlayerState>? _stateSub;
   bool _playing = false;
 
   @override
   void initState() {
     super.initState();
-    _player.onPlayerStateChanged.listen((state) {
+    _stateSub = _player.onPlayerStateChanged.listen((state) {
       if (mounted) setState(() => _playing = state == PlayerState.playing);
     });
     _player.setSourceDeviceFile(widget.path).then((_) {
       if (mounted) _player.resume();
-    });
+    }, onError: (_) {});
   }
 
   @override
   void dispose() {
+    _stateSub?.cancel();
     _player.dispose();
     super.dispose();
   }

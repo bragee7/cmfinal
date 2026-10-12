@@ -335,7 +335,7 @@ class PowerGuardService : Service() {
         )
         val notif = NotificationCompat.Builder(this, "zelda_voice_protection")
             .setContentTitle("\uD83D\uDEA8 ZELDA SOS TRIGGERED")
-            .setContentText("Swipe to cancel — recording starts automatically…")
+            .setContentText("Tap Cancel SOS — recording starts automatically…")
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)

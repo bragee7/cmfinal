@@ -21,6 +21,9 @@ class PowerSosService {
   static const pendingKey = 'zelda_power_sos_trigger';
   static const enabledKey = 'zelda_power_sos_enabled';
 
+  /// Key stashing the pre-logout power-SOS flag so login can restore it.
+  static const preLogoutKey = 'zelda_power_sos_enabled_prelogout';
+
   /// Pending triggers older than this are stale (e.g. consumed late).
   static const freshnessWindow = Duration(seconds: 60);
 

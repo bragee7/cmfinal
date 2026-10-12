@@ -173,6 +173,17 @@ class VoiceGuardService {
     return prefs.getBool(_enabledPrefKey) ?? false;
   }
 
+  /// Key stashing the pre-logout voice flag so login can restore it.
+  /// (Logout clears [_enabledPrefKey]; without the stash the choice is lost.)
+  static const preLogoutKey = 'zelda_voice_guard_enabled_prelogout';
+
+  /// Raw tri-state read of the voice flag: null = never set (fresh install).
+  /// Lets callers distinguish an explicit user-off from "no choice recorded".
+  static Future<bool?> getEnabledPrefRaw() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_enabledPrefKey);
+  }
+
   static Future<void> setEnabledPref(bool enabled) async {
     // Timeout-guarded: on some HyperOS builds the prefs channel can stall;
     // a stall here must never wedge the toggle silently (best-effort write).
@@ -496,9 +507,11 @@ class VoiceGuardService {
         .timeout(const Duration(seconds: 3))
         .catchError((_) => false);
     if (alreadyRunning) {
-      await flog('main', 'service already running — requesting re-promote');
+      await flog('main',
+          'service already running — requesting re-promote + engine boot check');
       try {
         _service.invoke('promote_to_foreground');
+        _service.invoke('boot_engine');
       } catch (_) {}
     } else {
       await flog('main', 'calling startService()');
@@ -579,13 +592,19 @@ class VoiceGuardService {
   }
 
   static Future<void> stop() async {
+    // Observability only: log the voice-OFF path (was log-silent). No
+    // start/stop semantics changed — same pref write + same unconditional
+    // invoke, with best-effort flog lines around them (flog never throws).
+    await flog('main', 'stop() entry (voice-off requested)');
     await setEnabledPref(false);
+    await flog('main', 'stop() enabled pref cleared, invoking bg stop');
     // Unconditional: invoking a non-running service is harmless, and gating
     // on isRunning() risks skipping a genuine stop. Delivery to a live
     // service may queue behind engine work, but it is never lost.
     try {
       _service.invoke('stop');
     } catch (_) {}
+    await flog('main', 'stop() invoke done');
   }
 
   static Future<bool> isRunning() =>
@@ -734,6 +753,9 @@ Future<void> _onStart(ServiceInstance service) async {
   // registration would leave a failed service unstoppable (toggle OFF =
   // no-op, toggle ON = silent no-op on the already-running service).
   service.on('stop').listen((_) async {
+    // Observability only: the voice-OFF path was log-silent. Same teardown
+    // order and semantics — flog lines bracket the existing steps.
+    await VoiceGuardService.flog('bg', 'stop received (voice-off)');
     // Unconditional: the ONLY senders of 'stop' are stop() (genuine user
     // off) and setTriggerWords() (restart — start() follows within ~1 s),
     // so every stop is honored. No pref reads (no cross-engine staleness),
@@ -746,11 +768,13 @@ Future<void> _onStart(ServiceInstance service) async {
     await pcmSub?.cancel();
     if (recorder != null) {
       try {
-        await recorder.stop();
+        await recorder?.stop();
       } catch (_) {}
     }
     kwsStream?.free();
     spotter?.free();
+    engineRunning = false;
+    await VoiceGuardService.flog('bg', 'stop teardown done, stopping self');
     service.stopSelf();
   });
 
@@ -846,7 +870,25 @@ Future<void> _onStart(ServiceInstance service) async {
   // default with a clear error instead of silently never working.
   // Same downstream path as before: dedupe + pending-trigger +
   // full-screen alarm in fireKeyword, so app-off hits still wake the phone.
-  try {
+  var engineBooting = false;
+  // Engine boot, re-runnable on demand (see the boot_engine handler at the
+  // end of this function): after a stop() teardown the isolate may stay
+  // alive engine-down (a system reboot lands it in STANDBY and the standby
+  // path never boots the engine), so start()/auto-start heal it through
+  // here instead of only re-promoting. Returns true when the engine is up.
+  Future<bool> bootEngine() async {
+    if (engineRunning) {
+      await VoiceGuardService.flog('bg', 'boot_engine: already up');
+      service.invoke(VoiceGuardService._statusEvent, {'running': true});
+      return true;
+    }
+    if (engineBooting) {
+      await VoiceGuardService.flog(
+          'bg', 'boot_engine: boot already in progress');
+      return false;
+    }
+    engineBooting = true;
+    try {
     await VoiceGuardService.markStage('engine-start');
     await VoiceGuardService.flog('bg', 'engine-start');
     initBindings();
@@ -877,7 +919,7 @@ Future<void> _onStart(ServiceInstance service) async {
         VoiceGuardService._errorEvent,
         {'error': 'Voice model unavailable: $e'},
       );
-      return;
+      return false;
     }
     debugPrint('VoiceGuard KWS models ready');
     note('Models ready, loading listener…');
@@ -933,7 +975,7 @@ Future<void> _onStart(ServiceInstance service) async {
         keywordsBufSize: utf8.encode(keywordsBuf).length,
       ),
     );
-    kwsStream = spotter.createStream();
+    kwsStream = spotter!.createStream();
     debugPrint('VoiceGuard KWS spotter created for: ${activeWords.join(', ')}');
     await VoiceGuardService.markStage('spotter-created');
     await VoiceGuardService.flog(
@@ -978,7 +1020,7 @@ Future<void> _onStart(ServiceInstance service) async {
       pcmSub = null;
       if (recorder != null) {
         try {
-          await recorder.stop();
+          await recorder?.stop();
         } catch (_) {}
       }
       await VoiceGuardService.flog('bg', 'mic loop paused by executor');
@@ -1051,7 +1093,7 @@ Future<void> _onStart(ServiceInstance service) async {
     }
 
     SosExecutor.bindMicHooks(onPause: stopMicLoop, onResume: startMicLoop);
-    if (!await startMicLoop()) return;
+    if (!await startMicLoop()) return false;
 
     debugPrint('VoiceGuard KWS engine started, listening');
     note('Listening for "${activeWords.first.toLowerCase()}"');
@@ -1059,6 +1101,7 @@ Future<void> _onStart(ServiceInstance service) async {
     await VoiceGuardService.flog('bg', 'ENGINE-UP listening');
     engineRunning = true;
     service.invoke(VoiceGuardService._statusEvent, {'running': true});
+    return true;
   } catch (e, s) {
     await VoiceGuardService.flog('bg', 'BG-CATCH: $e');
     developer.log(
@@ -1071,8 +1114,17 @@ Future<void> _onStart(ServiceInstance service) async {
     service.invoke(VoiceGuardService._errorEvent, {'error': '$e'});
     engineRunning = false;
     service.invoke(VoiceGuardService._statusEvent, {'running': false});
-    return;
+    return false;
+  } finally {
+    engineBooting = false;
   }
+  }
+
+  service.on('boot_engine').listen((_) async {
+    await VoiceGuardService.flog('bg', 'boot_engine requested');
+    await bootEngine();
+  });
+  if (!await bootEngine()) return;
 
   Timer.periodic(const Duration(seconds: 10), (_) {
     service.invoke('heartbeat');

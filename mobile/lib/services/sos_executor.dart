@@ -42,6 +42,10 @@ class SosExecutor {
   static const nativeDoneKey = 'zelda_sos_native_done';
   static const alarmRequestKey = 'zelda_sos_alarm_request';
   static const alarmHandledKey = 'zelda_sos_alarm_handled';
+  // Sending-phase marker: written on entering 'sending', cleared on every
+  // exit (sent / failed / cancel / fresh trigger / stale reset). Lets boot
+  // reconcile distinguish "interrupted mid-send" from idle without auto-send.
+  static const sendingAtKey = 'zelda_sos_sending_at';
 
   // ── cross-isolate invoke protocol (BG <-> main) ──
   static const sosStateEvent = 'sos_state';
@@ -141,6 +145,32 @@ class SosExecutor {
     try {
       final prefs = await SharedPreferences.getInstance()
           .timeout(const Duration(seconds: 5));
+      // Sending-phase reconcile (boot during 'sending'): the in-memory loop
+      // restarts idle while prefs still says sending. Never auto-send here —
+      // reconcile to a safe re-check only. A delivered caseId parks as
+      // listening; otherwise refresh startedAt once so the UI stale-owner
+      // gate sees a recent owner instead of an instantly-stale orphan (the
+      // existing stale path re-checks evidence after its own timeout).
+      try {
+        final bootState = prefs.getString(stateKey) ?? '';
+        final sendingMarked =
+            prefs.containsKey(sendingAtKey) || bootState == 'sending';
+        if (sendingMarked) {
+          final deliveredId = prefs.getString(caseIdKey) ?? '';
+          if (deliveredId.isNotEmpty) {
+            await prefs.remove(sendingAtKey);
+            await prefs.setString(stateKey, 'listening');
+            await prefs.setInt(remainingKey, 0);
+            await VoiceGuardService.flog('sosexec',
+                'reconciled interrupted sending with case=$deliveredId → listening (no resend)');
+          } else {
+            await prefs.setInt(
+                startedAtKey, DateTime.now().millisecondsSinceEpoch);
+            await VoiceGuardService.flog('sosexec',
+                'reconciled interrupted sending → hold for re-check (no auto-send)');
+          }
+        }
+      } catch (_) {}
       if ((prefs.getString(stateKey) ?? '') != 'recording') return;
       if (!prefs.containsKey(nativeDoneKey)) return;
       if ((prefs.getString(caseIdKey) ?? '').isNotEmpty) return;
@@ -188,6 +218,7 @@ class SosExecutor {
     await prefs.setBool(audioOnlyKey, false);
     await prefs.setString(nativeCommandKey, '');
     await prefs.remove(nativeDoneKey);
+    await prefs.remove(sendingAtKey);
     // Native alarm (full-screen cancel UI over home/lock screen). The
     // persistent PowerGuardService polls this key and posts the FSI
     // notification — no platform channel needed from the BG isolate.
@@ -223,6 +254,7 @@ class SosExecutor {
       await prefs.setInt(remainingKey, 0);
       await prefs.setString(commandKey, '');
       await prefs.setString(nativeCommandKey, 'stop');
+      await prefs.remove(sendingAtKey);
     } catch (_) {}
     _stopTracking();
     await VoiceGuardService.flog('sosexec', 'CANCELLED ($reason)');
@@ -261,6 +293,15 @@ class SosExecutor {
         await _doCancel('alarm-activity cancel');
         return;
       }
+
+      // Live-owner heartbeat: renew startedAt on every tick while owned so
+      // the UI stale-owner gate (which expects per-tick renewal) keeps
+      // seeing a live owner. Additive only: phase/remaining/broadcast timing
+      // below is untouched.
+      try {
+        await prefs.setInt(
+            startedAtKey, DateTime.now().millisecondsSinceEpoch);
+      } catch (_) {}
 
       _remaining -= 1;
       if (_remaining > 0) {
@@ -409,6 +450,7 @@ class SosExecutor {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(stateKey, _phase);
+      await prefs.setInt(sendingAtKey, DateTime.now().millisecondsSinceEpoch);
     } catch (_) {}
     _broadcast();
 
@@ -463,6 +505,7 @@ class SosExecutor {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString(stateKey, _phase);
         await prefs.setString(caseIdKey, caseData.id);
+        await prefs.remove(sendingAtKey);
       } catch (_) {}
       await VoiceGuardService.flog('sosexec', 'SENT case=${caseData.id}');
       _broadcast(extra: {
@@ -483,6 +526,7 @@ class SosExecutor {
       try {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString(stateKey, _phase);
+        await prefs.remove(sendingAtKey);
       } catch (_) {}
       await VoiceGuardService.flog('sosexec', 'SEND FAILED: $e');
       await _resumeMicBestEffort('send-failed');
@@ -617,6 +661,7 @@ class SosExecutor {
       await prefs.setInt(remainingKey, 0);
       await prefs.remove(commandKey);
       await prefs.remove(nativeDoneKey);
+      await prefs.remove(sendingAtKey);
     } catch (_) {}
   }
 }

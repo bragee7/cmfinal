@@ -4,6 +4,7 @@ import 'package:camera/camera.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/sos_case.dart';
 import '../services/location_service.dart';
@@ -655,6 +656,11 @@ class SosController extends ChangeNotifier {
       final locationLink = _locationLink;
       final latitude = _location?.latitude.toString() ?? '';
       final longitude = _location?.longitude.toString() ?? '';
+      // Scope for the connection-drop re-check below: only a case created
+      // by THIS attempt may be adopted (a different concurrent case must not
+      // match). Captured before the first create; happy-path untouched
+      // because _verifyCaseDelivered only runs after a connection drop.
+      final attemptStartedAt = DateTime.now().toUtc();
 
       SosCase? caseData;
       try {
@@ -676,7 +682,7 @@ class SosController extends ChangeNotifier {
             e.error.toString().contains('Connection closed');
 
         if (isConnectionDrop) {
-          caseData ??= await _verifyCaseDelivered();
+          caseData ??= await _verifyCaseDelivered(since: attemptStartedAt);
           caseData ??= await _sosService.createCase(
               videoPath: videoPath,
               audioPath: audioPath,
@@ -696,6 +702,18 @@ class SosController extends ChangeNotifier {
       _success = 'Emergency alert sent successfully! Help is on the way. Your live location is being tracked.';
       notifyListeners();
 
+      // Mirror the delivered case id (BG send does the same) so the
+      // executor's _resumeInterrupted caseId guard cannot be bypassed by a
+      // local send. Silent prefs write only: states/broadcasts unchanged.
+      try {
+        final deliveredId = caseData.id;
+        if (deliveredId.isNotEmpty) {
+          final prefs = await SharedPreferences.getInstance()
+              .timeout(const Duration(seconds: 5));
+          await prefs.setString(SosExecutor.caseIdKey, deliveredId);
+        }
+      } catch (_) {}
+
       startLocationTracking(caseData.id);
 
       VoiceGuardService.resetDetectionCooldown();
@@ -713,16 +731,26 @@ class SosController extends ChangeNotifier {
     }
   }
 
-  Future<SosCase?> _verifyCaseDelivered() async {
+  Future<SosCase?> _verifyCaseDelivered({DateTime? since}) async {
     try {
       final cases = await _sosService.getCases();
       if (cases.isEmpty) return null;
       final newest = cases.first;
       final createdAt = newest.createdAt ?? newest.timestamp;
       if (createdAt == null) return null;
-      final age = DateTime.now().toUtc().difference(createdAt.toUtc());
-      if (age.inSeconds <= 60) return newest;
-      return null;
+      final createdUtc = createdAt.toUtc();
+      final nowUtc = DateTime.now().toUtc();
+      final age = nowUtc.difference(createdUtc);
+      // Reject future-dated (clock skew) and older-than-60s cases as before.
+      if (age.inSeconds < -30 || age.inSeconds > 60) return null;
+      // Scope to the case just created: a newest case that predates this
+      // send attempt is a DIFFERENT concurrent case and must not be
+      // adopted. 15s tolerance covers client/server clock skew.
+      if (since != null &&
+          createdUtc.isBefore(since.toUtc().subtract(const Duration(seconds: 15)))) {
+        return null;
+      }
+      return newest;
     } catch (_) {
       return null;
     }

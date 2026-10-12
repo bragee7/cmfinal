@@ -47,7 +47,9 @@ app.use('/api/auth/login', strictLimiter(rlWindowMs, 10));
 app.use('/api/auth/register', strictLimiter(60 * 60 * 1000, 5));
 app.use('/api/auth/verify-otp', strictLimiter(rlWindowMs, 10));
 app.use('/api/auth/resend-otp', strictLimiter(rlWindowMs, 10));
-app.post('/api/sos', strictLimiter(rlWindowMs, 10));
+// Strict rate-limit for SOS creation. Explicit next() fall-through to the
+// sosRoutes router mounted below (app.use('/api/sos', sosRoutes) handles POST /).
+app.post('/api/sos', strictLimiter(rlWindowMs, 10), (req, res, next) => next());
 
 app.use(cors());
 app.use(express.json());
