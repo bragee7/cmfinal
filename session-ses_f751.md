@@ -3547,3 +3547,17 @@ Wave-1 (19 files): session hardening, boot-resync, SOS edges, contacts/alerts/de
 
 ---
 
+## 2026-10-12 - KWS lock-state proof + mic stall-watchdog (7d6eed0)
+
+User: "help me not working when i say" — ordered laptop-speaker self-test ("i put the laptop volume up max so yourself said and chck and fix it").
+TTS "help me" 3x (Vol 100, Rate -1) → TRIGGER voice:Help me 14:35:52 → full cycle → 500 → Idle. Works.
+Locked-vs-unlocked A/B: screen-ON-locked 3x TTS → deaf; unlocked same TTS → TRIGGER 15:38:19. Looked like lock-deafness.
+TEMP-DIAG mic-health (chunks/RMS/age per 10s heartbeat) built+installed (PID 26579): screen-OFF TTS → TRIGGER 15:47:52 (mic healthy chunks~125); screen-ON-locked TTS → TRIGGER 15:51:22 (chunks=125 to trigger). MATRIX COMPLETE: off/locked/unlocked ALL hear — no systematic deafness; earlier miss = per-boot fluke (broken stream). Complaint explained by dead-engine eras (fixed).
+Kept LIGHT permanent: bootEngine({force}) re-boots dead engine after 2 silent heartbeats (armed after ever-chunked, capped 3/boot, skipped when executor-paused); 10s mic-health line as telemetry. Analyze clean, build OK, installed PID 10360, fresh boot ENGINE-UP 15:57:34, final TTS TRIGGER 15:58:15 on final binary → resolved Idle.
+- `git commit 7d6eed0` (voice_guard_service.dart, 91+/4-); `git push cmfinal HEAD:main` → 90962a1..7d6eed0; `git ls-remote cmfinal HEAD` VERIFIED at 7d6eed0.
+
+### Assistant metadata
+KWS proven in all lock states on-device; watchdog is defense-in-depth for flaky mic streams. Backend fixes still LOCAL (need Render deploy). Still open (need user): say "help me" live, lock-screen taps, notif Cancel-action tap. SOS lifecycle transitions unchanged.
+
+---
+
