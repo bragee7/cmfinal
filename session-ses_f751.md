@@ -3575,3 +3575,16 @@ Side sagas: thermal/load (CPU 52C, skin 46 throttling, RAM 99%, 2.2GB swap after
 
 ---
 
+## 2026-10-13 - Elite 4-blocker fixes (recording-Cancel + static pill)
+User posted Elite Engineer prompt (4 claimed blockers). Verified each against code + device logs before fixing.
+- Voice multi-try: NO tunable exists (KeywordSpotterConfig has no threshold param, sensitivity model-fixed; record plugin 6.2.1 has zero audioSource support so no VOICE_RECOGNITION path). User's multi-try = dead-engine eras (fixed) + loud rooms (evidenced: 6/6 TTS fires, 53 ENGINE-UPs + 5 Keyword-confirmed 09:11-09:21). No algo change possible - documented.
+- Cancel: executor honors cancel in ALL recording phases (code-verified); gap was PURELY UI (in-app recording card had NO Cancel). Added Cancel SOS button to _buildRecording wired to existing cancelSOS() (zero lifecycle change). Verified on device: renders during recording x3 dumps; tap silently cancelled recording SOS (no send 2.5min, process alive) - recording-phase cancel emits no CANCELLED flog (all observed CANCELLED lines are window-phase; minor observability gap, documented).
+- Pill moves: container never translated, only thumb did (322) + snap-back. Rewrote: thumb STATIC, cancel on EVERY release (tap or any drag). Satisfies stable-on-press + maximally forgiving.
+- Dispatch 500s: client proven correct (SENT cases + alerts history; 500 proves routing). Root = server uploadMedia throws, fixed locally, NOT deployed to Render (00:57:53 500 confirms). No client 500-retry (duplicate risk). Action = DEPLOY.
+- `git commit 14bb7d3` (dashboard + SosAlarmActivity, 31+/23-); `git push cmfinal HEAD:main` -> eebfeca..14bb7d3; `git ls-remote cmfinal HEAD` VERIFIED at 14bb7d3.
+
+### Assistant metadata
+Elite fixes done + verified as far as budget allows; commit queue empty. Still open (need user): their-voice check, lock taps, notif-action tap, Render deploy (backend team). SOS lifecycle transitions unchanged throughout.
+
+---
+
