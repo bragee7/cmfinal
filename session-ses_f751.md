@@ -3588,3 +3588,15 @@ Elite fixes done + verified as far as budget allows; commit queue empty. Still o
 
 ---
 
+## 2026-10-13 - Phase A: TFLite first-stage KWS harness (bypass, boot-proven)
+
+User: model-first order ("first the model then render ... complete the app and the new model"). Started OWW-ONNX cascade migration: researched ORT dep (`onnxruntime` 1.4.1) + OWW runtime spec (mel->embedding->classifier ONNX chain; embedding backbone Apache-2.0 shippable; pretrained word models CC-BY-NC-SA so train own; threshold 0.5, patience, energy gate, Opset 11/IR7 Android precedent).
+Build BLOCKER found + resolved: mergeDebugNativeLibs duplicate `libonnxruntime.so` — sherpa bundles ORT 1.28.2 (22MB full) vs gtbluesky 1.15.1 (14MB slim); libsherpa-onnx-c-api.so dynamically links ORT (NEEDED string found) so pickFirst either way is unsafe (GT-wins kills voice engine; sherpa-wins probably OK but fragile ordering — unacceptable for safety app). PIVOTED harness to tflite_flutter 0.12.1 (different .so, zero conflict; aligns with microWakeWord-TFLite int8 + probability_cutoff + community Colab trainers).
+Wrote mobile/lib/services/tiny_first_stage.dart (TinyConfig cutoff 0.9/patience 3/enabled=false/energyFloor; init fromAsset + shape-inspected framing + quant branches + dummy-run fail-fast + bypass flog; feed ring->80ms->energy gate->run->patience->candidate; reset/dispose; release()d sessions). Wired into BG engine (import/init after spotter-created/feed after samples loop/reset on resume). API fixes via analyzer loop (TfLiteType kTfLite* int consts; Tensor.type wrapper needs .value). Deleted oww_first_stage.dart (never tracked). Analyze clean both files. Build OK (no pickFirst), installed, boot proof on device: `[tiny] first-stage disabled by config (sherpa-only bypass)` + normal ENGINE-UP + watchdog success (PID 26721) — harness alive, behavior identical.
+- `git commit aaded71` (voice_guard wiring + tiny_first_stage.dart + pubspec/lock tflite_flutter, 4 files 282+); `git push cmfinal HEAD:main` -> 6613ec9..aaded71; `git ls-remote cmfinal HEAD` VERIFIED at aaded71.
+
+### Assistant metadata
+Phase A done + boot-proven; commit queue empty. Phase B needs user: ~20 quiet-room "help me" voice clips + training compute choice (Colab vs local GPU). Still open: their-voice check, lock taps, notif-action tap, Render deploy. SOS lifecycle transitions unchanged throughout.
+
+---
+
