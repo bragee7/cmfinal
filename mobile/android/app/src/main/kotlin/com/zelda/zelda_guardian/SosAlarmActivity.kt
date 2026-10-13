@@ -238,8 +238,9 @@ class SosAlarmActivity : Activity() {
         }
         root.addView(subtitleText)
 
-        // Bottom: swipe-to-cancel pill (thumb slides right; release past
-        // 55% cancels). Tapping "Cancel" also cancels (accessibility).
+        // Bottom: cancel pill. The pill NEVER moves under the finger:
+        // pressing must not shift the button. Any release — plain tap or
+        // swipe of any length — cancels via the shared command=cancel path.
         root.addView(buildCancelPill())
         return root
     }
@@ -304,45 +305,36 @@ class SosAlarmActivity : Activity() {
         val slop = ViewConfiguration.get(this).scaledTouchSlop
         var downX = 0f
         var dragging = false
-        var moved = false
-        pill.setOnTouchListener { v, ev ->
+        pill.setOnTouchListener { _, ev ->
             when (ev.action) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = ev.x
                     dragging = true
-                    moved = false
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (dragging) {
-                        val max = (v.width - thumbSize - dp(this@SosAlarmActivity, 16)).coerceAtLeast(1)
-                        val dx = (ev.x - downX).coerceIn(0f, max.toFloat())
-                        if (dx > slop) {
-                            moved = true
-                            thumb.translationX = dx
-                            if (dx >= max * 0.55f) {
-                                dragging = false
-                                cancelSos()
-                            }
-                        }
+                    // Deliberately NO visual movement: the pill and the X
+                    // thumb stay exactly where they are while pressed.
+                    // A swipe past touch-slop cancels immediately; anything
+                    // shorter cancels on release below. No snap-back needed
+                    // because nothing ever translates.
+                    if (dragging && ev.x - downX > slop) {
+                        dragging = false
+                        cancelSos()
                     }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
                     if (dragging) {
                         dragging = false
-                        if (!moved) {
-                            // Plain tap anywhere on the pill cancels.
-                            cancelSos()
-                        } else {
-                            thumb.animate().translationX(0f).setDuration(150).start()
-                        }
+                        // Plain tap, or a swipe that never passed slop:
+                        // both cancel. There is no dead gesture on this pill.
+                        cancelSos()
                     }
                     true
                 }
                 MotionEvent.ACTION_CANCEL -> {
                     dragging = false
-                    thumb.animate().translationX(0f).setDuration(150).start()
                     true
                 }
                 else -> true

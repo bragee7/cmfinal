@@ -751,6 +751,22 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
             'Recording your emergency situation...',
             style: TextStyle(color: AppColors.gray400),
           ),
+          const SizedBox(height: 16),
+          // Cancel affordance during recording: the executor honors
+          // command=cancel in every recording phase (poll, app-report,
+          // native-recording) and cancelSOS() stops the camera for the
+          // local path, so this is a pure UI addition — no lifecycle change.
+          OutlinedButton.icon(
+            onPressed: () => sos.cancelSOS(),
+            icon: const Icon(Icons.close, color: AppColors.red500),
+            label: const Text(
+              'Cancel SOS',
+              style: TextStyle(color: AppColors.red500),
+            ),
+            style: OutlinedButton.styleFrom(
+              side: const BorderSide(color: AppColors.red500),
+            ),
+          ),
         ],
       ),
     );
