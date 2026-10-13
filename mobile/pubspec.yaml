@@ -29,7 +29,6 @@ dependencies:
   shared_preferences: ^2.5.5
   sherpa_onnx: ^1.13.8
   socket_io_client: ^3.1.6
-  tflite_flutter: ^0.12.1
   url_launcher: ^6.3.2
   video_player: ^2.11.1
   wakelock_plus: ^1.7.0

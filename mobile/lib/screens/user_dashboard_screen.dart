@@ -85,6 +85,11 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
   /// statusStream listener correct the toggle — never start/stop here.
   Future<void> _resyncSwitches() async {
     try {
+      // Re-assert FGS mic promotion on every foreground return (init +
+      // resume): a service auto-started while backgrounded (e.g. after a
+      // reboot) runs UNPROMOTED with its mic muted to zeros until something
+      // promotes it. Idempotent, silent on failure (BG dead or backgrounded).
+      VoiceGuardService.serviceInvoke('promote_to_foreground');
       final actualPower = await PowerSosService.isEnabled();
       if (!mounted) return;
       // ignore: use_build_context_synchronously
@@ -142,7 +147,11 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
       // handler no-ops (re-affirms status) when the engine is already up.
       if (rawPref == null || rawPref) {
         await VoiceGuardService.flog('dashboard',
-            'auto-start: service alive, requesting engine boot check');
+            'auto-start: service alive, requesting promote + engine boot check');
+        // Promote FIRST: an unpromoted service (reboot auto-start in
+        // background) has its mic muted to zeros; boot_engine alone cannot
+        // revive capture. Dashboard init runs foreground ⇒ allowed.
+        VoiceGuardService.serviceInvoke('promote_to_foreground');
         VoiceGuardService.serviceInvoke('boot_engine');
       }
       return;

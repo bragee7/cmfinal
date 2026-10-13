@@ -15,7 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart';
 
 import 'keyword_model_manager.dart';
-import 'tiny_first_stage.dart';
+
 import 'sos_executor.dart';
 
 class VoiceGuardService {
@@ -889,6 +889,11 @@ Future<void> _onStart(ServiceInstance service) async {
   bool micEverChunked = false;
   int micSilentBeats = 0;
   int micStallRestarts = 0;
+  // Zero-energy beats: consecutive heartbeats with chunks arriving but EXACT
+  // zero energy (background-muted/stuck AudioRecord passes the count check).
+  int micZeroBeats = 0;
+  // VAD-gate skips this window (telemetry for CPU savings).
+  int vadSkipped = 0;
   // Engine boot, re-runnable on demand (see the boot_engine handler at the
   // end of this function): after a stop() teardown the isolate may stay
   // alive engine-down (a system reboot lands it in STANDBY and the standby
@@ -1029,9 +1034,6 @@ Future<void> _onStart(ServiceInstance service) async {
     await VoiceGuardService.markStage('spotter-created');
     await VoiceGuardService.flog(
         'bg', 'spotter-created words=${activeWords.join('|')}');
-    // Phase A first-stage harness (bypass default until a model lands).
-    await TinyFirstStage.init(log: VoiceGuardService.flog);
-
     Future<void> fireKeyword(String keyword) async {
       final now = DateTime.now();
       final isDuplicate =
@@ -1126,6 +1128,7 @@ Future<void> _onStart(ServiceInstance service) async {
       final Uint8List chunk = c is Uint8List ? c : Uint8List.fromList(c);
       final int n = chunk.length ~/ 2;
       final Float32List samples = Float32List(n);
+      double chunkSumSq = 0.0;
       for (int i = 0; i < n; i++) {
         int v = chunk[2 * i] | (chunk[2 * i + 1] << 8);
         if (v >= 32768) v -= 65536;
@@ -1133,12 +1136,19 @@ Future<void> _onStart(ServiceInstance service) async {
         samples[i] = s;
         diagSumSq += s * s;
         diagSamples++;
+        chunkSumSq += s * s;
       }
-      // Phase A first-stage observer (bypass default): sync feed, never throws.
-      TinyFirstStage.feed(samples);
       final spot = spotter;
       final stream = kwsStream;
       if (spot == null || stream == null) return;
+      // VAD gate (CPU saver, zero training): skip spotter decode on
+      // true-silence chunks. Floor sits ~10x below quiet-room mean-square
+      // (~0.0006) and infinitely above digital zero — whispered-nearby
+      // speech reads far above it. Skips counted in mic-health.
+      if (n > 0 && chunkSumSq / n < 0.00005) {
+        vadSkipped++;
+        return;
+      }
       stream.acceptWaveform(samples: samples, sampleRate: 16000);
       while (spot.isReady(stream)) {
         spot.decode(stream);
@@ -1162,7 +1172,6 @@ Future<void> _onStart(ServiceInstance service) async {
         await stopMicLoop();
       },
       onResume: () async {
-        TinyFirstStage.reset(); // fresh audio context after executor pause
         await startMicLoop();
         micPausedByExecutor = false;
       },
@@ -1200,21 +1209,49 @@ Future<void> _onStart(ServiceInstance service) async {
   });
   if (!await bootEngine()) return;
 
-  Timer.periodic(const Duration(seconds: 10), (_) {
+  Timer.periodic(const Duration(seconds: 10), (_) async {
     service.invoke('heartbeat');
     // Mic-health telemetry (cheap, 1 line/10s — proved its worth twice).
     final int nowMs = DateTime.now().millisecondsSinceEpoch;
     final int ageMs = diagLastChunkMs == 0 ? -1 : nowMs - diagLastChunkMs;
     unawaited(VoiceGuardService.flog('bg',
-        'mic-health chunks=$diagChunks samples=$diagSamples sumSq=$diagSumSq lastChunkAgeMs=$ageMs'));
+        'mic-health chunks=$diagChunks samples=$diagSamples sumSq=$diagSumSq vadSkipped=$vadSkipped lastChunkAgeMs=$ageMs'));
     // Stall watchdog: a live-but-silent stream (zero chunks while listening,
     // never while executor-paused for native recording) gets restarted.
     // Arms only after the stream proved healthy once; capped at 3 restarts
     // per boot to avoid a hot loop on a permanently-dead mic.
+    // Zero-energy watchdog: chunks arriving with EXACT-zero energy (digital
+    // zeros from a background-muted or stuck AudioRecord) PASS the count
+    // check, so they get their own trigger: sustained exact-zero while
+    // listening first attempts a re-promote (policy mutes need foreground),
+    // then rebuilds the stream (stuck handles need a fresh AudioRecord).
+    // Quiet rooms read ~50-300/window, never exact 0.0, so the 1e-9 bound
+    // cannot misfire on real silence.
     if (micPausedByExecutor) {
       micSilentBeats = 0;
+      micZeroBeats = 0;
+    } else if (diagChunks > 0 && diagSumSq <= 1e-9) {
+      micSilentBeats = 0;
+      micZeroBeats++;
+      if (micZeroBeats == 3 || micZeroBeats == 6) {
+        try {
+          if (service is AndroidServiceInstance) {
+            await service.setAsForegroundService();
+            await VoiceGuardService.flog('bg', 'zero-energy re-promote attempted');
+          }
+        } catch (e) {
+          await VoiceGuardService.flog('bg', 'zero-energy re-promote failed: $e');
+        }
+      }
+      if (micZeroBeats >= 6 && micEverChunked && micStallRestarts < 3) {
+        micStallRestarts++;
+        micZeroBeats = 0;
+        micSilentBeats = 0;
+        unawaited(bootEngine(force: true));
+      }
     } else if (diagChunks > 0) {
       micSilentBeats = 0;
+      micZeroBeats = 0;
       micStallRestarts = 0;
     } else {
       micSilentBeats++;
@@ -1227,6 +1264,7 @@ Future<void> _onStart(ServiceInstance service) async {
     diagChunks = 0;
     diagSumSq = 0.0;
     diagSamples = 0;
+    vadSkipped = 0;
   });
 }
 
