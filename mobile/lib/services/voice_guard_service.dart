@@ -15,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart';
 
 import 'keyword_model_manager.dart';
+import 'tiny_first_stage.dart';
 import 'sos_executor.dart';
 
 class VoiceGuardService {
@@ -1028,6 +1029,8 @@ Future<void> _onStart(ServiceInstance service) async {
     await VoiceGuardService.markStage('spotter-created');
     await VoiceGuardService.flog(
         'bg', 'spotter-created words=${activeWords.join('|')}');
+    // Phase A first-stage harness (bypass default until a model lands).
+    await TinyFirstStage.init(log: VoiceGuardService.flog);
 
     Future<void> fireKeyword(String keyword) async {
       final now = DateTime.now();
@@ -1131,6 +1134,8 @@ Future<void> _onStart(ServiceInstance service) async {
         diagSumSq += s * s;
         diagSamples++;
       }
+      // Phase A first-stage observer (bypass default): sync feed, never throws.
+      TinyFirstStage.feed(samples);
       final spot = spotter;
       final stream = kwsStream;
       if (spot == null || stream == null) return;
@@ -1157,6 +1162,7 @@ Future<void> _onStart(ServiceInstance service) async {
         await stopMicLoop();
       },
       onResume: () async {
+        TinyFirstStage.reset(); // fresh audio context after executor pause
         await startMicLoop();
         micPausedByExecutor = false;
       },
