@@ -3600,3 +3600,16 @@ Phase A done + boot-proven; commit queue empty. Phase B needs user: ~20 quiet-ro
 
 ---
 
+## 2026-10-13 - Outside-app voice fix (unpromoted mic-mute) + VAD-gate + 8813031
+
+### Thinking
+Unpromoted BG service (reboot auto-start in background, FGS promotion denied silently) → OS zeroes background mic (sumSq=0.0 x30) → KWS deaf outside app. Foregrounding alone unmuted mic (energy 0→1788, zero code ran). Fix: promote on dashboard auto-start + every resume, heartbeat self-promote, zero-energy watchdog (re-promote then stream restart), VAD-gate (skip decode on true silence), remove unused TFLite harness+dep.
+
+### Tool input/output
+Device proofs: dumpsys BackgroundService isForeground=true id 256; mic live 30s+ while app backgrounded (no zeros); background TRIGGER voice:Help me 14:53:39 (app backgrounded, service foregrounded); VAD vadSkipped 17-40 (15-30% silent chunks skipped); SOS resolved SEND FAILED 500 (Render old code) → mic resumed → Idle. `flutter analyze` clean; build 45.4s OK.
+
+### Assistant metadata
+Committed 8813031 (5 files, 57+/286-: auto-start/resync promote + zero-energy watchdog + VAD-gate + harness/tflite removal), pushed cmfinal main b784feb..8813031, ls-remote verified. No-training truth stands (keep sherpa + VAD-gate). Still open: Render deploy (backend owner), user voice/lock/notif-action taps. SOS lifecycle transitions unchanged throughout.
+
+---
+
