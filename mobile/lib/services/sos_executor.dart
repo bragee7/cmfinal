@@ -244,7 +244,20 @@ class SosExecutor {
     await _doCancel('user cancel');
   }
 
+  /// Post-cancel voice grace: new voice fires are suppressed this long after
+  /// an explicit user cancel (every _doCancel reason below is user-initiated:
+  /// in-app, alarm pill, notif action, recording-phase). Manual/power
+  /// triggers bypass it entirely (the grace is checked only in the voice
+  /// path). Single source of truth for the banner text.
+  static const int postCancelGraceSeconds = 20;
+  static Duration get postCancelVoiceGrace =>
+      Duration(seconds: postCancelGraceSeconds);
+  static DateTime? lastUserCancelAt;
+
   static Future<void> _doCancel(String reason) async {
+    // Stamp every user cancel so voice auto-trigger stays quiet for the
+    // grace period; deliberate manual/power triggers stay instant.
+    lastUserCancelAt = DateTime.now();
     _active = false;
     _phase = 'listening';
     _remaining = 0;
@@ -259,7 +272,11 @@ class SosExecutor {
     _stopTracking();
     await VoiceGuardService.flog('sosexec', 'CANCELLED ($reason)');
     await _resumeMicBestEffort('cancelled');
-    _broadcast(extra: {'cancelled': true, 'message': 'SOS alert cancelled'});
+    _broadcast(extra: {
+      'cancelled': true,
+      'message':
+          'SOS cancelled — voice trigger paused ${postCancelGraceSeconds}s'
+    });
   }
 
   /// 1s heartbeat: power-trigger poll, cancel-command poll, countdown ticks.

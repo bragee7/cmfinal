@@ -457,7 +457,8 @@ class SosController extends ChangeNotifier {
     _countdownRef = null;
     _countdown = null;
     _status = SosStatus.listening;
-    _success = 'SOS alert cancelled';
+    _success =
+        'SOS cancelled — voice trigger paused ${SosExecutor.postCancelGraceSeconds}s';
     VoiceGuardService.resetDetectionCooldown();
     notifyListeners();
     Future.delayed(const Duration(seconds: 3), () {

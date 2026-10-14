@@ -1051,6 +1051,26 @@ Future<void> _onStart(ServiceInstance service) async {
         );
         return;
       }
+      // Post-cancel grace: after an explicit user cancel, ambient voice
+      // ("did it cancel?", TV dialogue, testing chatter) must not instantly
+      // re-fire a new SOS — that loop feels exactly like "cancel doesn't
+      // work". Manual/power triggers bypass this (checked only here).
+      final cancelAge = SosExecutor.lastUserCancelAt == null
+          ? null
+          : now.difference(SosExecutor.lastUserCancelAt!);
+      if (cancelAge != null && cancelAge < SosExecutor.postCancelVoiceGrace) {
+        final remaining = SosExecutor.postCancelVoiceGrace.inSeconds -
+            cancelAge.inSeconds;
+        developer.log(
+          'Keyword "$keyword" suppressed post-cancel (${remaining}s left)',
+          name: 'VoiceGuard',
+        );
+        await VoiceGuardService.flog(
+          'bg',
+          'voice suppressed ${remaining}s post-cancel (grace=${SosExecutor.postCancelGraceSeconds}s)',
+        );
+        return;
+      }
       VoiceGuardService._lastTriggeredAt = now;
       VoiceGuardService._lastTriggeredKeyword = keyword;
       developer.log('Keyword confirmed: $keyword', name: 'VoiceGuard');
