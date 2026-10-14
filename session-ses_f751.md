@@ -3613,3 +3613,16 @@ Committed 8813031 (5 files, 57+/286-: auto-start/resync promote + zero-energy wa
 
 ---
 
+## 2026-10-13 - Post-cancel voice grace 20s (cancel-everywhere complaint; cancels proven working, re-fire loop fixed)
+
+### Thinking
+User reported cancel broken on all surfaces (in-app, home, lock, cancel-screen pill) twice. Full diagnosis: pill touch verified correct (DOWN-claims-true, MOVE-right-fires, UP-release cancels), cancelSos body correct (COMMAND=cancel + finish), finished flag innocent (false until onDestroy, no onNewIntent), notif Cancel action code verified correct (explicit intent + UPDATE_CURRENT|IMMUTABLE + getForegroundService O+, writes identical command key). Voice-log history decisive: 16:09-16:11 machine-gun session ~8 trigger-cancel pairs ALL completed (user-cancel x3+, alarm-activity x6, incl recording-phase), grace/dedupe flogs live, ZERO failed cancels ever; last activity 21:27 then logout 21:42:11 (engine stopped; user in Meesho, phone untouched by adb). Conclusion: every cancel works; user's feeling = self re-triggering within seconds of cancel (manual re-triggers at 16:11:39 unaffected by voice-only grace by design) + 1-6s cancel latency + possible shade-covering-pill confusion. Fix: 20s post-cancel VOICE grace (fireKeyword suppresses new voice fires within 20s of explicit user cancel with remaining-seconds flog; manual/power always instant); cancel banner extended (voice paused 20s notice). Deliberate=instant honors their 1s demand; ambient=graceful.
+
+### Tool input/output
+4 edits, `flutter analyze` clean. Device proofs pending user-assisted run (user triggers+cancels, log-watched timed speaks at +5s/+25s). Build from this tree pending (grace untested on device at commit time).
+
+### Assistant metadata
+Committed 55c19f0 (3 files, 40+/2-: executor statics + _doCancel stamp/message + fireKeyword grace-suppression + controller banner), pushed cmfinal main 38c6874..55c19f0, ls-remote verified. SOS lifecycle untouched (additive grace check only). Still open: Render deploy (backend owner), user-assisted grace verify, user voice/lock/notif-action taps.
+
+---
+
