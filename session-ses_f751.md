@@ -3626,3 +3626,16 @@ Committed 55c19f0 (3 files, 40+/2-: executor statics + _doCancel stamp/message +
 
 ---
 
+## 2026-10-15 - Full-app regression: standby-heal voice fix + in-app cancel proof + first SENT on final build
+
+### Thinking
+Full regression on Redmi 2312DRAABI (final debug build, server up). Fresh pm-clear reinstall exposed REAL bug: BG isolate boots STANDBY (voice pref unset) and old _onStart returned early BEFORE boot_engine handler registration, so the post-login dashboard heal invoke landed on no listener — voice silently dead despite toggle ON (proven: re-promoted x3, zero boot_engine/ENGINE-UP in log). In-app cancel adb saga: 7 misses root-caused to (a) swipes starting x=100/200 left of pill (pill starts x~130, drag must start inside), (b) error banner shifting pill y 1945->1975 across runs. Fixed method (x-start-inside 300 + y-band coverage) → CANCELLED (user cancel) 16:11:39, mic resumed, zero send. Power SOS 16:13:46 → native recording → mic resumed (sent) 16:14:02 — first SUCCESSFUL server send (video evidence). Notif 259 persists post-send with actions=1 (Cancel SOS action live). Contacts CRUD, alerts list, case details, trigger-words save, voice toggle OFF/ON cycle all PASS. HTTP-500s on other sends are server-side (backend out of scope). Standby-heal ORDERING path not live-exercised (secure pattern lock blocked adb login after pm clear); code-verified + analyze-clean.
+
+### Tool input/output
+`flutter analyze` clean. 10 manual triggers (9 full-send attempts: 8x HTTP-500 + 1x SENT), 1 in-app cancel verified, 1 power trigger verified. Diff: voice_guard_service.dart only (35+/9-: standby falls through to handler registration, startFullTimer() extraction, heal cancels standby heartbeat).
+
+### Assistant metadata
+Committed f29da05 (standby-heal fix, 1 file), pushed cmfinal main. SOS logic untouched throughout. Needs user: re-login (pm clear wiped session), unlock phone, notif-action tap test, lock-tap coordination, KWS voice test.
+
+---
+
