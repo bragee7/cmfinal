@@ -845,6 +845,10 @@ Future<void> _onStart(ServiceInstance service) async {
   await VoiceGuardService.flog('bg', 'executor-up');
 
   bool voiceOn = true;
+  // Standby heartbeat, cancelled once the engine boots (post-login heal via
+  // boot_engine). Declared here so both the standby branch and bootEngine
+  // can reach it. No SOS path touches this.
+  Timer? standbyHeartbeat;
   try {
     voiceOn = await VoiceGuardService.wasEnabled()
         .timeout(const Duration(seconds: 5));
@@ -856,10 +860,16 @@ Future<void> _onStart(ServiceInstance service) async {
     await VoiceGuardService.markStage('engine-standby');
     await VoiceGuardService.flog('bg', 'STANDBY (voice off, executor only)');
     service.invoke(VoiceGuardService._statusEvent, {'running': false});
-    Timer.periodic(const Duration(seconds: 10), (_) {
+    standbyHeartbeat = Timer.periodic(const Duration(seconds: 10), (_) {
       service.invoke('heartbeat');
     });
-    return;
+    // NO return here (was: early return): the boot_engine handler is
+    // registered at the end of this function. A fresh-install isolate boots
+    // in standby (voice pref unset), then the user logs in and the dashboard
+    // heal invokes boot_engine — with the early return that invoke landed on
+    // no listener and voice stayed silently dead despite the toggle reading
+    // ON. Fall through so the handler is always live; the guard below keeps
+    // standby from booting the engine by itself.
   }
 
   // ── Keyword-spotter engine (KWS only, no speech-to-text stage) ──
@@ -1223,13 +1233,11 @@ Future<void> _onStart(ServiceInstance service) async {
   }
   }
 
-  service.on('boot_engine').listen((_) async {
-    await VoiceGuardService.flog('bg', 'boot_engine requested');
-    await bootEngine();
-  });
-  if (!await bootEngine()) return;
-
-  Timer.periodic(const Duration(seconds: 10), (_) async {
+  bool fullTimerOn = false;
+  void startFullTimer() {
+    if (fullTimerOn) return;
+    fullTimerOn = true;
+    Timer.periodic(const Duration(seconds: 10), (_) async {
     service.invoke('heartbeat');
     // Mic-health telemetry (cheap, 1 line/10s — proved its worth twice).
     final int nowMs = DateTime.now().millisecondsSinceEpoch;
@@ -1285,7 +1293,25 @@ Future<void> _onStart(ServiceInstance service) async {
     diagSumSq = 0.0;
     diagSamples = 0;
     vadSkipped = 0;
+    });
+  }
+
+  service.on('boot_engine').listen((_) async {
+    await VoiceGuardService.flog('bg', 'boot_engine requested');
+    if (await bootEngine()) {
+      standbyHeartbeat?.cancel();
+      standbyHeartbeat = null;
+      startFullTimer();
+    }
   });
+  // Standby isolates stop here with handlers live: the engine boots only via
+  // an explicit boot_engine invoke (dashboard post-login heal) or a fresh
+  // startService() (voice toggle ON from true-off). Keeps the standby
+  // contract (no mic capture before the user opts in) while making the heal
+  // path real.
+  if (!voiceOn) return;
+  if (!await bootEngine()) return;
+  startFullTimer();
 }
 
 class _LifecycleObserver with WidgetsBindingObserver {
