@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
+import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
 
 /**
@@ -102,6 +103,18 @@ class PowerGuardService : Service() {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
                 .cancel(ALARM_NOTIF_ID)
         } catch (_: Exception) {}
+    }
+
+    // Collapsed-visible cancel: custom content view carrying a Cancel button
+    // that fires the SAME alarmCancelPi() as the expanded action, so the user
+    // can cancel from a collapsed heads-up / lock shade with one tap (no
+    // chevron-expansion needed). Display plumbing only — SOS untouched.
+    private fun alarmCancelViews(text: String): RemoteViews {
+        val rv = RemoteViews(packageName, R.layout.notif_alarm_cancel)
+        rv.setTextViewText(R.id.notif_alarm_title, "\uD83D\uDEA8 ZELDA SOS TRIGGERED")
+        rv.setTextViewText(R.id.notif_alarm_text, text)
+        rv.setOnClickPendingIntent(R.id.notif_cancel_btn, alarmCancelPi())
+        return rv
     }
 
     private fun alarmCancelPi(): PendingIntent {
@@ -336,6 +349,10 @@ class PowerGuardService : Service() {
         val notif = NotificationCompat.Builder(this, "zelda_voice_protection")
             .setContentTitle("\uD83D\uDEA8 ZELDA SOS TRIGGERED")
             .setContentText("Tap Cancel SOS — recording starts automatically…")
+            .setCustomContentView(alarmCancelViews("Tap Cancel SOS — recording starts automatically…"))
+            .setCustomBigContentView(alarmCancelViews("Tap Cancel SOS — recording starts automatically…"))
+            .setStyle(NotificationCompat.DecoratedCustomViewStyle())
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
@@ -561,6 +578,10 @@ class PowerGuardService : Service() {
         val notif = NotificationCompat.Builder(this, "zelda_voice_protection")
             .setContentTitle("\uD83D\uDEA8 ZELDA SOS TRIGGERED")
             .setContentText("Power pressed 3x. Opening app to send SOS...")
+            .setCustomContentView(alarmCancelViews("Power pressed 3x. Opening app to send SOS..."))
+            .setCustomBigContentView(alarmCancelViews("Power pressed 3x. Opening app to send SOS..."))
+            .setStyle(NotificationCompat.DecoratedCustomViewStyle())
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
