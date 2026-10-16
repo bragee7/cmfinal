@@ -3639,3 +3639,16 @@ Committed f29da05 (standby-heal fix, 1 file), pushed cmfinal main. SOS logic unt
 
 ---
 
+## 2026-10-16 - Collapsed-cancel fix: custom notif content view + push 722863e
+
+### Thinking
+Killed-app/lock complaint ("cancel screen not displaying") root-caused: MIUI denies background startActivity even with SAW=allow (Permission Denied, BAL result=102), and FSI downgrades to heads-up when screen is ON at trigger — proven via logcat START lines + FSI_REQUESTED_BUT_DENIED record. Heads-up IS visible over secure lock (3 screenshots prove) but arrives COLLAPSED; chevron-expansion via blind adb failed 4x (moving-target layouts) and synthetic `am` delivery is blocked (service not exported — good security). GENUINE FIX (display-only, SOS untouched): RemoteViews custom collapsed view (res/layout/notif_alarm_cancel.xml — title + text + red Cancel SOS button wired to SAME alarmCancelPi) set via setCustomContentView/setCustomBigContentView on BOTH alarm builders, so one-tap cancel needs no expansion. 9th live case SENT 22:09:10 (server sends SUCCEED now). FGS/heal/standby fixes all verified live earlier (cmfinal @ 8fb8660).
+
+### Tool input/output
+`flutter analyze mobile/lib mobile/android` → No issues found. `flutter build apk --debug` OK → `adb install -r` Success → monkey relaunch PID 2072 → dashboard 22:07:30 → ENGINE-UP 22:07:36 → watchdog success. Committed 722863e (PowerGuardService.kt +21, res/layout/notif_alarm_cancel.xml new; 62 insertions), pushed cmfinal main 8fb8660..722863e, ls-remote VERIFIED at 722863e.
+
+### Assistant metadata
+Display plumbing only — SOS trigger/countdown/cancel/recording/GPS/backend untouched. Visual verify of custom collapsed Cancel + tap test BLOCKED (phone display OFF, user holding it). Needs user: lay phone screen-up untouched for screenshot verify, or tap collapsed Cancel themselves. Untracked leftovers intentionally uncommitted.
+
+---
+
