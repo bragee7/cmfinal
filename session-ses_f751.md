@@ -3652,3 +3652,14 @@ Display plumbing only — SOS trigger/countdown/cancel/recording/GPS/backend unt
 
 ---
 
+
+## 2026-10-17 - Lock-screen saga closed: user chose B (keep pattern lock); cancel paths proven by user self-tests
+
+### Thinking
+Permission-layer fix (all-4 appops allow incl uid-mode `set --uid` for SAW+FSI) restored the fullscreen cancel screen on UNLOCKED home - user confirmed with own eyes ("the cancel screen was displaying ... it display on home screen"). Over the SECURE PATTERN keyguard MIUI still hard-denies the activity start (BAL allowed result=102 then MIUI KeyguardLocked denial) - fullscreen over secure lock is not achievable app-side. Options given: (A) lock back to swipe for fullscreen over lock (zero code) or (B) keep pattern; lock-screen cancel via notification 259 "Cancel SOS" action (proven visible over secure lock; tap writes the same flutter.zelda_sos_command="cancel" path as the in-app pill; executor logs CANCELLED (alarm-activity cancel), no send). User picked A first, final answer B. NO CODE CHANGE needed for B. User self-tests 06:52 on current build: CANCELLED (alarm-activity cancel) 06:52:16 and CANCELLED (user cancel) 06:52:22, mic resumed both, ZERO sends - native and in-app cancel chains verified live, no new backend cases. Voice toggled OFF by user 06:52:24; app process later ended. 08:10 relaunch: session restore failed ("Unable to restore session. Please log in." - server-side token invalid; app correctly navigated to login); user logged in 08:10:50, ENGINE-UP 08:10:56. Re-armed state: voice_guard_enabled=true, power_sos_enabled=true, sos_state=listening, command empty.
+
+### Tool input/output
+Evidence: voice-debug.log lines 06:52 + 08:10; prefs snapshot; locksettings=false + dumpsys lock_settings CredentialType: PATTERN (B consistent with device); appops all-4 allow, rejectTime frozen at 22:43 yesterday (zero new denials); pidof relaunched, dashboard shown. Revert of custom RemoteViews = 20199a0 (display-only; exact 'as before' + approved Cancel SOS action).
+
+### Assistant metadata
+SOS logic untouched. Final accepted behavior: unlocked home = fullscreen cancel screen; lock screen = notification with one-tap Cancel SOS action; voice + power triggers unchanged. Optional remaining (user-side): live confirm of B flow on lock screen.
