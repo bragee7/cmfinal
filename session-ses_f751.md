@@ -3663,3 +3663,18 @@ Evidence: voice-debug.log lines 06:52 + 08:10; prefs snapshot; locksettings=fals
 
 ### Assistant metadata
 SOS logic untouched. Final accepted behavior: unlocked home = fullscreen cancel screen; lock screen = notification with one-tap Cancel SOS action; voice + power triggers unchanged. Optional remaining (user-side): live confirm of B flow on lock screen.
+
+---
+
+## 2026-10-17 (evening) - REEVALUATED: lock-screen cancel display FIXED - real root cause = hidden MIUI appops 10020/10021 denials; device grants applied (no code change)
+
+### Thinking
+User escalated: wants the fullscreen cancel screen itself over the lock screen (voice or power trigger, phone locked). Forensics of the morning failure: full appops dump showed TWO hidden MIUI ops DENIED with rejectTime matching the exact 08:14 locked-test trigger moments: MIUIOP(10020) = ignore (lock-screen display related) and MIUIOP(10021) = ignore (background pop-up / background activity start; MIUI default DENY, requires manual grant; websearch: 10021 = background pop-up permission). All standard ops already allow (SAW, FSI, all 4 layers). Code/manifest already correct (showWhenLocked + turnScreenOn + requestDismissKeyguard). FIX = device-side grants only: `cmd appops set com.zelda.zelda_guardian 10020 allow` and `10021 allow` -> both verified allow afterwards; rejectTimes frozen (no new denials at later triggers). NO code change; SOS logic untouched.
+
+### Tool input/output
+VERIFIED WORKING 13:11 (locked, screen lit): power trigger 13:11:11.2 -> SosAlarmActivity launched over lock; tap at (540,2220) [cancel pill area] -> 13:11:14.07 [sosexec] CANCELLED (alarm-activity cancel) + mic resumed (cancelled) + ZERO send => cancel screen WAS displayed over the secure pattern lock and its button consumed the tap. Same-day triggers before grants: UI never surfaced. Later tests 13:07:52 / 13:13:30 / 13:14:49: tasks created + focused even screen-off (dumpsys mLastFocusedRootTask=Task{...SosAlarmActivity} #964/#968; MIUIOP 10020 accessed+allowed) but panel stayed dark - see limitations.
+
+### Assistant metadata
+LIMITATIONS (device, not app): (1) TURN_SCREEN_ON appop cannot be granted via adb on this MIUI (name, --uid and numeric 61 all silently refuse; stays default + rejects) -> after a locked+screen-off trigger the activity is up but the panel may stay black until the user presses power/uncovers. (2) MIUI pocket-mode (MiuiPocketModeProximitySensor) keeps the panel dark (display ON, brightness 0.0017 min, black frames, touch suppressed) while the phone is covered/face-down; the 13:11 pass worked because the screen was already lit. (3) `adb install -r` WIPES appops grants - re-apply after every reinstall: cmd appops set com.zelda.zelda_guardian 10020 allow; cmd appops set com.zelda.zelda_guardian 10021 allow. Manual equivalent: Settings > Apps > ZELDA > permissions: lock-screen display + background pop-up ALLOW. (4) Server sends were 500-ing again this afternoon: 13:08:37 and 13:14:13 SEND FAILED HTTP 500 (no cases created); 08:13:44 user test did send (case ed345117). (5) Stale native keys (sos_native_command=start_recording / sos_native_done) accumulated from aborted cycles; cleaned twice via run-as sed while app was dead. This entry supersedes the earlier 'not achievable app-side' note: with 10020/10021 allowed the cancel screen now displays over the secure pattern lock.
+
+---
