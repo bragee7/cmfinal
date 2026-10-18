@@ -69,18 +69,14 @@ class PowerGuardService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIF_ID, buildNotification())
-        if (intent?.action == ACTION_TRIGGER ||
-            intent?.action == PowerPressReceiver.toString()) {
-            postAlarmNotification()
-        }
-        // When the trigger intent arrives via startForegroundService(trigger),
-        // its action is ACTION_TRIGGER — post the loud alarm too.
-        if (intent?.action == "com.zelda.zelda_guardian.POWER_SOS_TRIGGER") {
+        // The power-press receiver arrives with ACTION_TRIGGER — post the
+        // cancel alarm once (the duplicate literal check that used to
+        // double-post here is gone).
+        if (intent?.action == ACTION_TRIGGER) {
             postAlarmNotification()
         }
         if (intent?.action == ACTION_CANCEL_ALARM) {
             handleAlarmCancel()
-            return START_STICKY
         }
         return START_STICKY
     }
@@ -311,6 +307,14 @@ class PowerGuardService : Service() {
             Log.i(TAG, "alarm UI launch debounced (already launched ${nowMs - lastAlarmUiLaunchMs} ms ago)")
             return
         }
+        // Already up (an earlier FSI/launch won the race): re-posting the FSI
+        // while the Activity shows re-fires the full-screen launch, which is
+        // exactly the visible flash. A showing Activity mirrors live prefs
+        // itself, so it never needs a re-post. Display only.
+        if (SosAlarmActivity.isShowing) {
+            Log.i(TAG, "alarm UI already showing — skipping re-post")
+            return
+        }
         lastAlarmUiLaunchMs = nowMs
         // Full-screen intent: the one mechanism allowed to appear over the
         // home/lock screen from the background.
@@ -351,34 +355,38 @@ class PowerGuardService : Service() {
             nm.notify(ALARM_NOTIF_ID, notif)
         } catch (e: Exception) {
             Log.w(TAG, "alarm FSI failed: ${e.message}")
-            // Last resort: direct launch attempt (usually blocked, best effort).
-            try {
-                startActivity(alarm)
-            } catch (_: Exception) {}
         }
-        // System-SOS style lock handoff: an FSI posts as heads-up only
-        // when the screen is off/locked, so ALWAYS also start the activity
-        // directly (overlay permission granted by the user) and try to wake
-        // the screen. Unconditional: the instantaneous keyguard read is
-        // unreliable across power-toggle races, and a direct start is
-        // harmless when unlocked. Display plumbing only — SOS state untouched.
-        try {
+        // Fallback for ROMs that withhold the FSI activity while the screen
+        // is off/locked (verified MIUI behavior): ONE delayed direct start on
+        // the coordinator thread — skipped when the FSI already brought the
+        // Activity up, and skipped when the flow was cancelled meanwhile.
+        // Replaces the old unconditional second launch (start flash +
+        // duplicate task record). SYSTEM_ALERT_WINDOW provides the
+        // background-activity-start exemption this needs. Display only.
+        coordHandler?.postDelayed({
             try {
-                val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-                @Suppress("DEPRECATION")
-                pm.newWakeLock(
-                    android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP or
-                        android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
-                    "zelda:sos-alarm-wake"
-                ).apply { acquire(30000) }
-            } catch (_: Exception) {}
-            try {
-                startActivity(alarm)
-                Log.i(TAG, "alarm activity direct-started alongside FSI")
+                val st = try {
+                    sosPrefs().getString("flutter.zelda_sos_state", "") ?: ""
+                } catch (_: Exception) { "" }
+                if (!SosAlarmActivity.isShowing &&
+                    (st == "cancelWindow" || st == "countdown")
+                ) {
+                    try {
+                        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+                        @Suppress("DEPRECATION")
+                        pm.newWakeLock(
+                            android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                                android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
+                            "zelda:sos-alarm-wake"
+                        ).apply { acquire(30000) }
+                    } catch (_: Exception) {}
+                    startActivity(alarm)
+                    Log.i(TAG, "alarm activity direct-started (FSI fallback)")
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "alarm direct start blocked: ${e.message}")
             }
-        } catch (_: Exception) {}
+        }, 1200)
     }
 
     private fun claimNativeFlow(prefs: android.content.SharedPreferences) {
@@ -399,7 +407,7 @@ class PowerGuardService : Service() {
             prefs.getString("flutter.zelda_sos_source", "") ?: ""
         } catch (_: Exception) { "" }
         nativeActive = true
-        nativePhase = "cancelWindow"
+        nativePhase = "countdown"
         nativeRemaining = 5
         lastTickMs = now
         try {
@@ -470,18 +478,8 @@ class PowerGuardService : Service() {
             } catch (_: Exception) {}
             return
         }
-        if (nativePhase == "cancelWindow") {
-            nativePhase = "countdown"
-            nativeRemaining = 3
-            try {
-                prefs.edit()
-                    .putString("flutter.zelda_sos_state", nativePhase)
-                    .putInt("flutter.zelda_sos_remaining", nativeRemaining)
-                    .apply()
-            } catch (_: Exception) {}
-            return
-        }
-        // Countdown elapsed → record natively (CameraX, audio fallback).
+        // Single 5s countdown elapsed → record natively (CameraX, audio
+        // fallback). No second phase.
         nativePhase = "recording"
         try {
             prefs.edit()

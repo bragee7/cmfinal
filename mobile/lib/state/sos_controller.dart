@@ -48,7 +48,6 @@ class SosController extends ChangeNotifier {
   CameraLensDirection _selectedLens = CameraLensDirection.back;
 
   Timer? _cancelTimerRef;
-  Timer? _countdownRef;
   Timer? _recordingTimerRef;
   Timer? _trackingRef;
   StreamSubscription<AppLocation>? _watchSub;
@@ -158,8 +157,8 @@ class SosController extends ChangeNotifier {
       final snap = await SosExecutor.readSnapshot();
       final raw = (snap['state'] as String?) ?? 'idle';
       if (raw != 'idle' && raw != 'listening') {
-        // Stale-owner gate: the longest real flow is ~60s (5s cancel + 3s
-        // countdown + 30s record + send), and the native driver renews
+        // Stale-owner gate: the longest real flow is ~60s (5s countdown +
+        // 30s record + send), and the native driver renews
         // started_at on every tick. An active snapshot older than the
         // threshold is therefore orphaned — even when the BG service
         // process happens to be alive, no live owner drives it. Applying
@@ -196,7 +195,6 @@ class SosController extends ChangeNotifier {
     _adoptedNative = false;
     if (_recordingTimerRef == null &&
         _cancelTimerRef == null &&
-        _countdownRef == null &&
         _status != SosStatus.sending &&
         _status != SosStatus.sent) {
       _status = SosStatus.listening;
@@ -216,8 +214,6 @@ class SosController extends ChangeNotifier {
         _adoptedNative = false;
         _cancelTimerRef?.cancel();
         _cancelTimerRef = null;
-        _countdownRef?.cancel();
-        _countdownRef = null;
         _status = mapped;
         _cancelTimer = null;
         _countdown = null;
@@ -230,8 +226,6 @@ class SosController extends ChangeNotifier {
       _mirroring = true;
       _cancelTimerRef?.cancel();
       _cancelTimerRef = null;
-      _countdownRef?.cancel();
-      _countdownRef = null;
       _status = mapped;
       if (mapped == SosStatus.cancelWindow) {
         _cancelTimer = remaining;
@@ -402,12 +396,14 @@ class SosController extends ChangeNotifier {
     }
 
     playAlertSound();
-    _status = SosStatus.cancelWindow;
+    _status = SosStatus.countdown;
     _cancelTimer = 5;
     _error = '';
     _success = '';
     notifyListeners();
 
+    // Single 5s cancel countdown (5→4→3→2→1) straight into recording — one
+    // timer, no second phase, nothing that could restart it.
     _cancelTimerRef?.cancel();
     _cancelTimerRef = Timer.periodic(const Duration(seconds: 1), (timer) {
       _cancelTimer = (_cancelTimer ?? 5) - 1;
@@ -415,7 +411,7 @@ class SosController extends ChangeNotifier {
         timer.cancel();
         _cancelTimerRef = null;
         _cancelTimer = null;
-        startCountdown();
+        startRecording();
       }
       notifyListeners();
     });
@@ -453,8 +449,6 @@ class SosController extends ChangeNotifier {
     _cancelTimerRef?.cancel();
     _cancelTimerRef = null;
     _cancelTimer = null;
-    _countdownRef?.cancel();
-    _countdownRef = null;
     _countdown = null;
     _status = SosStatus.listening;
     _success =
@@ -463,24 +457,6 @@ class SosController extends ChangeNotifier {
     notifyListeners();
     Future.delayed(const Duration(seconds: 3), () {
       _success = '';
-      notifyListeners();
-    });
-  }
-
-  void startCountdown() {
-    _status = SosStatus.countdown;
-    _countdown = 3;
-    notifyListeners();
-
-    _countdownRef?.cancel();
-    _countdownRef = Timer.periodic(const Duration(seconds: 1), (timer) {
-      _countdown = (_countdown ?? 3) - 1;
-      if (_countdown! <= 0) {
-        timer.cancel();
-        _countdownRef = null;
-        _countdown = null;
-        startRecording();
-      }
       notifyListeners();
     });
   }
@@ -807,7 +783,6 @@ class SosController extends ChangeNotifier {
   @override
   void dispose() {
     _cancelTimerRef?.cancel();
-    _countdownRef?.cancel();
     _recordingTimerRef?.cancel();
     _trackingRef?.cancel();
     _mirrorTimer?.cancel();

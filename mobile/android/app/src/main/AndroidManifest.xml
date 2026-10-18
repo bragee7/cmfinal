@@ -74,7 +74,7 @@
             android:showWhenLocked="true"
             android:turnScreenOn="true"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|density|uiMode"
-            android:theme="@style/NormalTheme"/>
+            android:theme="@style/SosAlarmTheme"/>
         <receiver
             android:name=".BootReceiver"
             android:exported="true">

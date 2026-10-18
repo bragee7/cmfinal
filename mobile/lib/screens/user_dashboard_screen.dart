@@ -544,10 +544,11 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
             ],
           ),
           const SizedBox(height: 12),
-          if (sos.status == SosStatus.cancelWindow)
+          // One merged cancel view drives both statuses (cancelWindow is a
+          // legacy mirror state only): a single 5s countdown, then recording.
+          if (sos.status == SosStatus.cancelWindow ||
+              sos.status == SosStatus.countdown)
             _buildCancelWindow(sos)
-          else if (sos.status == SosStatus.countdown)
-            _buildCountdown(sos)
           else if (sos.status == SosStatus.recording)
             _buildRecording(sos)
           else if (sos.status == SosStatus.sending)
@@ -578,11 +579,12 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
     }
   }
 
-  /// Zelda Emergency SOS cancel window — styled after the Android Emergency
-  /// SOS reference: dark screen, title, big live countdown in a coral ring,
-  /// swipe-to-cancel bar at the bottom. The SOS is ALREADY triggered, so
-  /// there is no "start" action anywhere here — only cancel.
+  /// Zelda Emergency SOS cancel countdown — styled after the Android
+  /// Emergency SOS reference: dark card, title, big live countdown in a
+  /// coral ring, prominent red Cancel SOS button. The SOS is ALREADY
+  /// triggered, so there is no "start" action anywhere here — only cancel.
   Widget _buildCancelWindow(SosController sos) {
+    final seconds = sos.cancelTimer ?? sos.countdown ?? 0;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 8),
       decoration: BoxDecoration(
@@ -632,7 +634,7 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
             ),
             alignment: Alignment.center,
             child: Text(
-              '${sos.cancelTimer ?? 0}',
+              '$seconds',
               style: const TextStyle(
                 fontSize: 84,
                 fontWeight: FontWeight.bold,
@@ -642,84 +644,34 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
           ),
           const SizedBox(height: 16),
           Text(
-            'SOS sends in ${sos.cancelTimer ?? 0}s — swipe to cancel',
+            'SOS will be sent in ${seconds}s',
             textAlign: TextAlign.center,
-            style:
-                const TextStyle(fontSize: 15, color: AppColors.gray300),
+            style: const TextStyle(fontSize: 15, color: AppColors.gray300),
           ),
           const SizedBox(height: 20),
-          Dismissible(
-            key: const ValueKey('zelda-sos-cancel-bar'),
-            direction: DismissDirection.startToEnd,
-            dismissThresholds: const {
-              DismissDirection.startToEnd: 0.45,
-            },
-            background: Container(
-              alignment: Alignment.centerLeft,
-              padding: const EdgeInsets.only(left: 24),
-              decoration: BoxDecoration(
-                color: AppColors.red600,
-                borderRadius: BorderRadius.circular(40),
+          // Prominent, always-visible cancel control — the countdown cannot
+          // be dismissed by gesture or rebuild; only this button cancels.
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: sos.cancelSOS,
+              icon: const Icon(Icons.close, color: Colors.white, size: 28),
+              label: const Text(
+                'Cancel SOS',
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                ),
               ),
-              child: const Icon(Icons.close, color: Colors.white, size: 30),
-            ),
-            onDismissed: (_) => sos.cancelSOS(),
-            child: GestureDetector(
-              onTap: sos.cancelSOS,
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
-                decoration: BoxDecoration(
-                  color: AppColors.gray700,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.red600,
+                padding: const EdgeInsets.symmetric(vertical: 18),
+                shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(40),
                 ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 64,
-                      height: 64,
-                      decoration: const BoxDecoration(
-                        color: Colors.white,
-                        shape: BoxShape.circle,
-                      ),
-                      alignment: Alignment.center,
-                      child: const Icon(Icons.close,
-                          color: Color(0xFF7A1F1F), size: 32),
-                    ),
-                    const SizedBox(width: 16),
-                    const Text(
-                      'Cancel',
-                      style: TextStyle(fontSize: 20, color: Colors.white),
-                    ),
-                    const Spacer(),
-                    const Icon(Icons.swipe_right,
-                        color: AppColors.gray300, size: 22),
-                  ],
-                ),
               ),
             ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCountdown(SosController sos) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 24),
-      child: Column(
-        children: [
-          Text(
-            '${sos.countdown ?? 0}',
-            style: const TextStyle(
-              fontSize: 72,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-            ),
-          ),
-          const Text(
-            'Get Ready!',
-            style: TextStyle(fontSize: 20, color: Colors.white),
           ),
         ],
       ),

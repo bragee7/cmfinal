@@ -13,7 +13,7 @@ import 'voice_guard_service.dart';
 /// microphone foreground service while voice protection is on, and booted
 /// on-demand into executor-standby mode for power-button triggers).
 ///
-/// Why this exists: every SOS timer (5s cancel window, 3s countdown,
+/// Why this exists: every SOS timer (5s countdown,
 /// 30s recording, 30s live tracking) used to live in the main-isolate
 /// SosController, which is only born when the dashboard mounts. A voice or
 /// power trigger fired while the app was closed could therefore only stash
@@ -97,6 +97,10 @@ class SosExecutor {
   static bool _active = false;
   static String _phase = 'idle';
   static int _remaining = 0;
+  /// Wall-clock start of the current cancel countdown. The 5→1 steps are
+  /// computed from elapsed time so each step lasts a full second no matter
+  /// where the shared 1s poll tick happens to fall.
+  static int _countdownStartMs = 0;
   static String _source = '';
   static int _busyNotifiedAt = 0;
 
@@ -203,8 +207,9 @@ class SosExecutor {
       return;
     }
     _active = true;
-    _phase = 'cancelWindow';
+    _phase = 'countdown';
     _remaining = 5;
+    _countdownStartMs = DateTime.now().millisecondsSinceEpoch;
     _source = source;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(stateKey, _phase);
@@ -320,29 +325,38 @@ class SosExecutor {
             startedAtKey, DateTime.now().millisecondsSinceEpoch);
       } catch (_) {}
 
-      _remaining -= 1;
-      if (_remaining > 0) {
-        await prefs.setInt(remainingKey, _remaining);
-        _broadcast();
-        return;
-      }
-
-      if (_phase == 'cancelWindow') {
-        _phase = 'countdown';
-        _remaining = 3;
-        await prefs.setString(stateKey, _phase);
-        await prefs.setInt(remainingKey, _remaining);
-        await VoiceGuardService.flog('sosexec', 'window elapsed → countdown');
-        _broadcast();
-        return;
-      }
-
+      // Single 5s cancel countdown (elapsed-driven): 5→4→3→2→1, one full
+      // second per step, then activation. No second phase, so the displayed
+      // number can never restart mid-flow.
       if (_phase == 'countdown') {
-        await _beginRecording(prefs);
+        final elapsed =
+            DateTime.now().millisecondsSinceEpoch - _countdownStartMs;
+        if (elapsed >= 5000) {
+          await _beginRecording(prefs);
+          return;
+        }
+        final rem = 5 - (elapsed ~/ 1000);
+        if (rem > 0 && rem != _remaining) {
+          _remaining = rem;
+          await prefs.setInt(remainingKey, _remaining);
+          _broadcast();
+        }
         return;
       }
-      // recording/sending/sent phases are event-driven (see below), the
-      // tick only keeps the poll alive for cancel + power triggers.
+
+      if (_phase == 'recording') {
+        // The 30s evidence window drives the number the UI mirror shows
+        // while the background owns the recording.
+        if (_remaining > 0) {
+          _remaining -= 1;
+          await prefs.setInt(remainingKey, _remaining);
+        }
+        _broadcast();
+        return;
+      }
+
+      // sending/sent phases are event-driven (see below), the tick only
+      // keeps the poll alive for cancel + power triggers.
       _broadcast();
     } catch (e) {
       await VoiceGuardService.flog('sosexec', 'poll error: $e');

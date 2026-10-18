@@ -100,14 +100,14 @@ class SosAlarmActivity : Activity() {
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // System-SOS style handoff: when the keyguard is a non-secure
-        // (swipe/none) lock, dismiss it behind this screen so the lock
-        // hands off to the cancel UI. On secure locks the system keeps
-        // the credential gate — never bypassed. Display only.
+        // System-SOS style handoff: only a NON-secure (swipe/none) keyguard
+        // is dismissed behind this screen. A secure lock keeps its credential
+        // gate — showWhenLocked above is what lets this UI display over the
+        // keyguard without ever prompting for the pattern/PIN. Display only.
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val km = getSystemService(KeyguardManager::class.java)
-                if (km != null && km.isKeyguardLocked) {
+                if (km != null && km.isKeyguardLocked && !km.isKeyguardSecure) {
                     km.requestDismissKeyguard(this, null)
                 }
             }
@@ -119,13 +119,13 @@ class SosAlarmActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        // Re-request the keyguard handoff: if onCreate ran while the screen
-        // was off or the activity was still behind the keyguard, the first
-        // request may not have taken effect. Same call, display only.
+        // Re-request the non-secure keyguard handoff (onCreate may have run
+        // while the screen was off). Same gating as onCreate — a secure lock
+        // is never dismissed from here. Display only.
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val km = getSystemService(KeyguardManager::class.java)
-                if (km != null && km.isKeyguardLocked) {
+                if (km != null && km.isKeyguardLocked && !km.isKeyguardSecure) {
                     km.requestDismissKeyguard(this, null)
                 }
             }
@@ -137,6 +137,14 @@ class SosAlarmActivity : Activity() {
         ui.removeCallbacks(refresher)
         isShowing = false
         super.onDestroy()
+    }
+
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        // The countdown must stay visible until the user cancels or it
+        // elapses: an accidental back gesture must not dismiss this UI
+        // (finishing without cancelling would hide the window while the
+        // SOS keeps running).
     }
 
     // ── UI (built programmatically to keep the screen in one file) ──
@@ -230,7 +238,7 @@ class SosAlarmActivity : Activity() {
         root.addView(center)
 
         subtitleText = TextView(this).apply {
-            text = "SOS sends automatically — swipe to cancel"
+            text = "SOS will be sent automatically — cancel to stop"
             setTextColor(Color.parseColor("#9AA0A6"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             gravity = Gravity.CENTER
@@ -364,14 +372,15 @@ class SosAlarmActivity : Activity() {
         when (state) {
             "cancelWindow", "countdown" -> {
                 lastActiveTs = System.currentTimeMillis()
-                if (remaining >= 1) {
-                    lastCount = remaining.toString()
-                    countText.text = lastCount
-                } else {
-                    // Transient gap between tick writes — keep last number.
-                    countText.text = lastCount
+                // Transient pref gaps keep the last number; only a CHANGED
+                // number touches the TextView (no redundant layout passes =
+                // no flicker while the digit ticks).
+                val shown =
+                    if (remaining >= 1) remaining.toString() else lastCount
+                if (shown != lastCount) {
+                    lastCount = shown
+                    countText.text = shown
                 }
-                subtitleText.text = "SOS sends automatically — swipe to cancel"
             }
             "recording", "sending", "sent" -> {
                 // Cancel window is over — the SOS (recording/upload) continues on
