@@ -3716,3 +3716,35 @@ Executed the requested end-to-end verification on the connected device (Redmi 23
 - Minor findings for the team: Case Details "Case ID:" label has an empty value; Case Information column wraps mid-word; contact name truncates ("Test C..."); delete dialog buttons both render red; post-failure red banner persists until dismissed and its X tap target is uncertain; server 500s on live sends (no new cases).
 - Not separately exercised: notification-shade "Cancel SOS" action tap (same PendingIntent/command path as in-app and native cancels, which are verified).
 - Cleanup: stale zelda_sos_native_command values (start_recording/stop) cleaned via run-as sed with the app force-stopped after each cycle; device settings restored (brightness mode=1; lock_screen_lock_after_timeout deleted -> null; stay_on_while_plugged_in 0; locksettings set-disabled false).
+
+
+---
+
+## 2026-10-18 - Part 5: Voice SOS trigger battery on the device (5 scenarios) - all passed; within-5s re-trigger correctly paused; mic-zeros lesson
+
+### Thinking
+Executed the user's full voice-trigger battery on the physical Redmi 2312DRAABI (Android 15/MIUI) with "Help me" spoken by the laptop TTS at volume 100 through the room audio path (not on-device playback), covering: (1) trigger inside the app, (2) trigger with the app in the background / home screen, (3) kill the app (recents right-swipe, the kill method the user specified) then trigger on the home screen, (4) same kill then trigger while locked with the screen off, (5) trigger -> cancel -> attempt to re-trigger by voice within a 5 second gap. Every trigger was cancelled during the countdown; ZERO SOS sends were performed (backend still returning HTTP 500 on live sends; no new cases).
+
+Results:
+- Test 1 (in app): trigger fired -> CANCELLED (user cancel) at 12:13, mic resumed, no send.
+- Test 2 (outside app, home): trigger fired -> CANCELLED (alarm-activity cancel) at 12:15, no send.
+- Test 3 (recents right-swipe kill + home): task killed, foreground service survived (by design), voice trigger fired -> native cancel during the countdown at 12:19, no send.
+- Test 4 (recents kill + lock screen, screen off): trigger fired while locked/screen-off -> CANCELLED (alarm-activity cancel) about 4.6 s in (12:24), no send.
+- Test 5 (trigger -> cancel -> re-trigger within 5 s by voice): trigger + cancel proven twice (mini-run 12:45:30-33; battery TTS 12:46:21-24 -> CANCELLED (user cancel), clean "mic resumed (cancelled)"). The re-trigger attempt at +2.6 s did NOT fire - the designed post-cancel anti-retrigger pause (banner: "SOS cancelled - voice trigger paused 20s") holds. Documented as intended behavior, not a bug. Re-arm: one cancel re-armed within ~49 s (the next TTS fired); after a later cancel the engine stayed silent even ~3.5 min later despite loud audio energy reaching the mic (sumSq spikes 148/256, vadSkipped climbing 3->38->81->102) - the spotter can degrade after many abort cycles; a fresh restart restores a clean armed state. Exact re-arm time not fully pinned (between ~23 s and ~49 s observed; fresh restart always re-arms).
+
+Mic lesson (root cause of earlier silent "no reaction" moments): a mic capture stream that STARTS while the screen is OFF can deliver digital zeros (sumSq=0.0, every chunk vadSkipped) - no keyword can match; it reproduces across restarts while the screen stays off. Revival = toggle Voice Protection OFF -> ON from a LIT screen (12:40): stream restarted with real audio (sumSq 30-95) and triggers worked immediately after. QA note: arm/test with the screen lit when possible.
+
+TTS lesson: call Add-Type -AssemblyName System.Speech BEFORE New-Object System.Speech.Synthesis.SpeechSynthesizer (otherwise Speak is a silent no-op - caused earlier misfires), Volume=100, Rate=0, Speak("help me") blocks ~0.7 s. Detect chain timing: [bg] Keyword confirmed: Help me -> native alarm requested -> [sosexec] TRIGGER source=voice:Help me about 1.3-2.0 s after speech start.
+
+Cleanup state: stale 'stop' key cleaned from shared prefs (grep -c -> 1, force-stop, run-as sed removal, verified empty, restart); app relaunched 12:50:56 with [bg] ENGINE-UP listening and prefs clean (native_command empty, sos_state=listening). No code changes were needed for this battery. NOTE: shortly after the cleanup the USB adb link dropped (device no longer listed by adb; kill-server/start-server did not recover it); the optional final post-restart voice spot-check could not be executed remotely. All battery evidence above was captured live before the drop.
+
+### Tool input/output
+- TTS from the laptop (room audio path proven: the alarm WAV even spiked the phone-mic sumSq to 749).
+- Trigger evidence (app_flutter/voice-debug.log): "[bg] Keyword confirmed: Help me" -> "native alarm requested" -> "[sosexec] TRIGGER source=voice:Help me".
+- Cancel evidence: in-app spray [taps (540,2220)+(540,2270) + swipe (200,2270)->(900,2270)] -> "[sosexec] CANCELLED (user cancel)" + "mic resumed (cancelled)" (about +1.7-2.0 s); locked/screen-off native pill taps (540,2220)/(540,2278) -> "CANCELLED (alarm-activity cancel)" (about +4.6 s). No swipes on the lock screen (launch shortcuts).
+- Kill semantics: recents right-swipe removes the task but the foreground service keeps listening (pid survived); force-stop fully kills voice (no auto-restart) - not used for this battery.
+- Mic diagnostics: "[bg] mic-health chunks=125 samples=160000 ... sumSq=... vadSkipped=..." (zeros case: sumSq=0.0 with all chunks vadSkipped).
+- Mic revival: dashboard voice toggle OFF -> ON at (888,922) from a lit screen.
+
+### Assistant metadata
+Battery verdict: voice SOS triggers and cancels work in all 5 requested scenarios; the within-5 s re-trigger is correctly suppressed by the post-cancel pause. Watch items: (a) post-cancel re-arm is not instant (~49 s observed; can degrade after many abort cycles - fresh restart always re-arms), (b) streams started screen-off can carry digital zeros - refresh via toggle with the screen lit, (c) after the battery the phone's USB adb link dropped - a physical re-plug is needed for further remote testing. Zero sends, no new backend cases; device state at last contact: engine listening, prefs clean.
