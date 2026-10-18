@@ -249,7 +249,7 @@ class SosExecutor {
   /// in-app, alarm pill, notif action, recording-phase). Manual/power
   /// triggers bypass it entirely (the grace is checked only in the voice
   /// path). Single source of truth for the banner text.
-  static const int postCancelGraceSeconds = 20;
+  static const int postCancelGraceSeconds = 5;
   static Duration get postCancelVoiceGrace =>
       Duration(seconds: postCancelGraceSeconds);
   static DateTime? lastUserCancelAt;
