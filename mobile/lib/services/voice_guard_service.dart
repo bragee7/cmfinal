@@ -30,6 +30,13 @@ class VoiceGuardService {
   static const fgsNotificationId = 256;
   static const alarmNotificationId = 257;
 
+  /// Periodic proactive KWS session rebuild while listening. Bounds the
+  /// silent-deafness stall observed on this ROM (≈30 min uptime: healthy mic
+  /// stream with real energy, yet the spotter stops confirming keywords —
+  /// only an app relaunch restored it). Each rebuild has a ≈1–2 s deaf
+  /// window; executor-owned mic time (native SOS recording) defers it.
+  static const _kwsRefreshPeriod = Duration(minutes: 5);
+
   /// Default trigger word. The user can add their own words from the
   /// dashboard — they are persisted and the listener rebuilds for them.
   static const List<String> defaultTriggerWords = ['Help me'];
@@ -331,6 +338,13 @@ class VoiceGuardService {
   static Stream<void> get appRecordingRequests =>
       _appRecordingController.stream;
 
+  /// True while the background engine is receiving only exact-zero mic data:
+  /// the OS silences capture for ineligible background services (observed on
+  /// MIUI/Android 15 — a boot-started engine gets digital zeros until the app
+  /// has a visible activity once). Driven by the 10 s 'heartbeat' event; the
+  /// dashboard must not claim "Listening" while this is true.
+  static final ValueNotifier<bool> micDegraded = ValueNotifier<bool>(false);
+
   static bool _configured = false;
 
   static Future<void> initialize() async {
@@ -414,6 +428,13 @@ class VoiceGuardService {
         _setForegroundEvent,
         {'foreground': _appInForeground},
       );
+    });
+    // Live mic-health heartbeat: the background isolate reports whether the
+    // engine hears real audio or exact zeros; the dashboard mirrors it so the
+    // status line never claims "Listening" while capture is silenced.
+    _service.on('heartbeat').listen((event) {
+      final degraded = event != null && event['degraded'] == true;
+      if (degraded != micDegraded.value) micDegraded.value = degraded;
     });
     // BG SOS executor snapshots (SosExecutor.sosStateEvent). The dashboard
     // mirrors these so an app opened mid-SOS shows the LIVE countdown.
@@ -883,6 +904,10 @@ Future<void> _onStart(ServiceInstance service) async {
   // Same downstream path as before: dedupe + pending-trigger +
   // full-screen alarm in fireKeyword, so app-off hits still wake the phone.
   var engineBooting = false;
+  // True when the last boot attempt failed (model download / mic stream /
+  // catch-all). While true, the dashboard banner must not claim Listening —
+  // the heartbeat carries degraded=true until a boot succeeds.
+  var engineFailed = false;
   // Mic-health telemetry + stall watchdog (permanent). Chunk counters and
   // window energy, written by the mic chunk loop and read by the 10s
   // heartbeat (both capture this scope; declared here so all users come
@@ -894,6 +919,9 @@ Future<void> _onStart(ServiceInstance service) async {
   int diagChunks = 0;
   double diagSumSq = 0.0;
   int diagSamples = 0;
+  // Chunks that PASSED the VAD gate and were fed to the spotter — this is
+  // what separates "deaf spotter" from "dead mic" in a post-mortem.
+  int diagDecoded = 0;
   int diagLastChunkMs = 0;
   bool micPausedByExecutor = false;
   bool micEverChunked = false;
@@ -904,12 +932,16 @@ Future<void> _onStart(ServiceInstance service) async {
   int micZeroBeats = 0;
   // VAD-gate skips this window (telemetry for CPU savings).
   int vadSkipped = 0;
+  // Periodic-refresh pacing: stamped when the engine reaches ENGINE-UP and
+  // re-stamped on every rebuild (see VoiceGuardService._kwsRefreshPeriod).
+  int engineUpSinceMs = 0;
+  int lastRefreshMs = 0;
   // Engine boot, re-runnable on demand (see the boot_engine handler at the
   // end of this function): after a stop() teardown the isolate may stay
   // alive engine-down (a system reboot lands it in STANDBY and the standby
   // path never boots the engine), so start()/auto-start heal it through
   // here instead of only re-promoting. Returns true when the engine is up.
-  Future<bool> bootEngine({bool force = false}) async {
+  Future<bool> bootEngine({bool force = false, String forceReason = 'stall'}) async {
     if (engineRunning && !force) {
       await VoiceGuardService.flog('bg', 'boot_engine: already up');
       service.invoke(VoiceGuardService._statusEvent, {'running': true});
@@ -925,8 +957,9 @@ Future<void> _onStart(ServiceInstance service) async {
             'bg', 'boot_engine: boot already in progress, skip force');
         return false;
       }
-      await VoiceGuardService.flog('bg',
-          'mic STALL: no chunks for 20s+, rebooting engine (attempt $micStallRestarts)');
+      await VoiceGuardService.flog('bg', forceReason == 'refresh'
+          ? 'spotter refresh: force-rebuilding KWS session'
+          : 'mic STALL: no chunks for 20s+, rebooting engine (attempt $micStallRestarts)');
       try {
         await pcmSub?.cancel();
       } catch (_) {}
@@ -983,6 +1016,7 @@ Future<void> _onStart(ServiceInstance service) async {
         VoiceGuardService._errorEvent,
         {'error': 'Voice model unavailable: $e'},
       );
+      engineFailed = true;
       return false;
     }
     debugPrint('VoiceGuard KWS models ready');
@@ -1117,6 +1151,15 @@ Future<void> _onStart(ServiceInstance service) async {
     // (Re)starts the mic stream + KWS chunk loop. Idempotent: a live loop
     // is left alone. Returns false when the mic genuinely cannot start.
     Future<bool> startMicLoop() async {
+    // Enforce the single-session invariant (the comment above always claimed
+    // idempotence; now the code has it). A live loop must never be
+    // double-started — two feeding listeners would decode every utterance
+    // twice. All teardown paths (stop handler, executor pause, force rebuild)
+    // null pcmSub first, so a genuine restart still passes.
+    if (pcmSub != null) {
+      await VoiceGuardService.flog('bg', 'startMicLoop skipped: loop already live');
+      return true;
+    }
     // Attempt-first mic open: the MAIN-isolate verdict stash lives in
     // FlutterSharedPreferences, which is ABSENT on this ROM (writes vanish),
     // and record.hasPermission() inside this BG isolate lies on MIUI (false
@@ -1144,6 +1187,7 @@ Future<void> _onStart(ServiceInstance service) async {
         VoiceGuardService._errorEvent,
         {'error': 'Microphone permission denied'},
       );
+      engineFailed = true;
       return false;
     }
 
@@ -1179,6 +1223,7 @@ Future<void> _onStart(ServiceInstance service) async {
         vadSkipped++;
         return;
       }
+      diagDecoded++;
       stream.acceptWaveform(samples: samples, sampleRate: 16000);
       while (spot.isReady(stream)) {
         spot.decode(stream);
@@ -1191,6 +1236,14 @@ Future<void> _onStart(ServiceInstance service) async {
       unawaited(fireKeyword(display));
     }, onError: (Object e) {
       debugPrint('[VoiceGuard] mic stream error: $e');
+      // Visible on-device now (debugPrints don't reach logcat on this ROM).
+      // Recovery: a dead stream stops delivering chunks, so the stall
+      // watchdog rebuilds the audio path within ~20–30 s.
+      unawaited(VoiceGuardService.flog('bg', 'mic stream error: $e'));
+      service.invoke(
+        VoiceGuardService._errorEvent,
+        {'error': 'Microphone stream error: $e'},
+      );
     });
       await VoiceGuardService.flog('bg', 'mic loop (re)started');
       return true;
@@ -1206,13 +1259,33 @@ Future<void> _onStart(ServiceInstance service) async {
         micPausedByExecutor = false;
       },
     );
-    if (!await startMicLoop()) return false;
+    if (micPausedByExecutor) {
+      // A boot raced the SOS executor's native evidence recording, which owns
+      // the mic right now. Boot the engine bookkeeping but skip capture — the
+      // executor's onResume hook starts the loop when it releases the mic.
+      note('Listening soon…');
+      await VoiceGuardService.markStage('engine-up');
+      await VoiceGuardService.flog('bg', 'ENGINE-UP deferred: executor owns mic');
+      engineRunning = true;
+      engineUpSinceMs = DateTime.now().millisecondsSinceEpoch;
+      lastRefreshMs = engineUpSinceMs;
+      engineFailed = false;
+      service.invoke(VoiceGuardService._statusEvent, {'running': true});
+      return true;
+    }
+    if (!await startMicLoop()) {
+      engineFailed = true;
+      return false;
+    }
 
     debugPrint('VoiceGuard KWS engine started, listening');
     note('Listening for "${activeWords.first.toLowerCase()}"');
     await VoiceGuardService.markStage('engine-up');
     await VoiceGuardService.flog('bg', 'ENGINE-UP listening');
     engineRunning = true;
+    engineUpSinceMs = DateTime.now().millisecondsSinceEpoch;
+    lastRefreshMs = engineUpSinceMs;
+    engineFailed = false;
     service.invoke(VoiceGuardService._statusEvent, {'running': true});
     return true;
   } catch (e, s) {
@@ -1227,6 +1300,7 @@ Future<void> _onStart(ServiceInstance service) async {
     service.invoke(VoiceGuardService._errorEvent, {'error': '$e'});
     engineRunning = false;
     service.invoke(VoiceGuardService._statusEvent, {'running': false});
+    engineFailed = true;
     return false;
   } finally {
     engineBooting = false;
@@ -1238,12 +1312,24 @@ Future<void> _onStart(ServiceInstance service) async {
     if (fullTimerOn) return;
     fullTimerOn = true;
     Timer.periodic(const Duration(seconds: 10), (_) async {
-    service.invoke('heartbeat');
+    // Engine claims listening but capture is verifiably dead: either chunks
+    // arrive as exact zeros (OS muting) or no chunk ever arrived (permission
+    // revoked / dead AudioRecord) — the UI must show degraded, not Listening.
+    final bool micDead = diagChunks == 0 &&
+        (micEverChunked
+            ? micStallRestarts >= 3
+            : engineUpSinceMs > 0 &&
+                DateTime.now().millisecondsSinceEpoch - engineUpSinceMs >
+                    45000);
+    service.invoke('heartbeat', {
+      'degraded': !micPausedByExecutor &&
+          (engineFailed || micZeroBeats >= 3 || micDead),
+    });
     // Mic-health telemetry (cheap, 1 line/10s — proved its worth twice).
     final int nowMs = DateTime.now().millisecondsSinceEpoch;
     final int ageMs = diagLastChunkMs == 0 ? -1 : nowMs - diagLastChunkMs;
     unawaited(VoiceGuardService.flog('bg',
-        'mic-health chunks=$diagChunks samples=$diagSamples sumSq=$diagSumSq vadSkipped=$vadSkipped lastChunkAgeMs=$ageMs'));
+        'mic-health chunks=$diagChunks decoded=$diagDecoded samples=$diagSamples sumSq=$diagSumSq vadSkipped=$vadSkipped lastChunkAgeMs=$ageMs'));
     // Stall watchdog: a live-but-silent stream (zero chunks while listening,
     // never while executor-paused for native recording) gets restarted.
     // Arms only after the stream proved healthy once; capped at 3 restarts
@@ -1271,6 +1357,14 @@ Future<void> _onStart(ServiceInstance service) async {
           await VoiceGuardService.flog('bg', 'zero-energy re-promote failed: $e');
         }
       }
+      if (micZeroBeats == 3) {
+        // Honest status: 30 s of exact-zero capture while "listening" means
+        // the OS is muting this background capture path (observed after a
+        // boot-started engine). The heartbeat payload carries degraded=true,
+        // so the UI shows "microphone muted" instead of "Listening".
+        unawaited(VoiceGuardService.flog(
+            'bg', 'mic degraded: 30s of exact-zero capture'));
+      }
       if (micZeroBeats >= 6 && micEverChunked && micStallRestarts < 3) {
         micStallRestarts++;
         micZeroBeats = 0;
@@ -1289,9 +1383,35 @@ Future<void> _onStart(ServiceInstance service) async {
         unawaited(bootEngine(force: true));
       }
     }
+    // Periodic KWS session refresh (anti-deafness). The spotter can go
+    // silently deaf over a long uptime: healthy chunks with real energy keep
+    // arriving, yet no keyword is ever confirmed (observed ≈30 min on this
+    // ROM; only an app relaunch restored it). Both watchdogs above check the
+    // MIC only, so that state passes them. This paced rebuild runs the same
+    // code path as a manual restart and hands the watchdog budgets a fresh
+    // allowance (pacing bounds the rate, so no hot loop). Skipped while the
+    // executor owns the mic for native SOS recording — the next tick
+    // re-checks.
+    if (engineRunning && !engineBooting && !micPausedByExecutor) {
+      final int anchor = lastRefreshMs > 0 ? lastRefreshMs : engineUpSinceMs;
+      final int refreshPeriodMs =
+          VoiceGuardService._kwsRefreshPeriod.inMilliseconds;
+      if (anchor > 0 && nowMs - anchor >= refreshPeriodMs) {
+        micStallRestarts = 0;
+        micSilentBeats = 0;
+        micZeroBeats = 0;
+        lastRefreshMs = nowMs;
+        final int uptimeMin =
+            engineUpSinceMs == 0 ? -1 : (nowMs - engineUpSinceMs) ~/ 60000;
+        unawaited(VoiceGuardService.flog('bg',
+            'spotter refresh (periodic): uptime=${uptimeMin}min, rebuilding KWS session'));
+        unawaited(bootEngine(force: true, forceReason: 'refresh'));
+      }
+    }
     diagChunks = 0;
     diagSumSq = 0.0;
     diagSamples = 0;
+    diagDecoded = 0;
     vadSkipped = 0;
     });
   }

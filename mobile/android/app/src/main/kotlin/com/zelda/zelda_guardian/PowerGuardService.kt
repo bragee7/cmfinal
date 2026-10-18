@@ -16,6 +16,7 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import id.flutter.flutter_background_service.BackgroundService
 
 /**
  * Lightweight always-on foreground service that owns the SCREEN_ON/OFF
@@ -180,8 +181,45 @@ class PowerGuardService : Service() {
     // Last launchAlarmUi() call (launch debounce, see launchAlarmUi).
     private var lastAlarmUiLaunchMs = 0L
 
+    // Last voice-engine supervisor check (see ensureVoiceEngineRunning).
+    private var lastVoiceCheckMs = 0L
+
     private fun sosPrefs() =
         getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+
+    /**
+     * Voice-engine supervisor. The FMBS BackgroundService has no durable
+     * self-restart (its respawn watchdog fires once ~5 s after each
+     * start/destroy and never re-arms), so after a raw process kill the
+     * voice listener stays down until the app is opened. PowerGuardService
+     * is START_STICKY and does come back — so whenever it is alive it
+     * revives the voice engine itself. Pref-gated on the user's voice SOS
+     * setting so a manual disable stays disabled; the plugin side dedupes
+     * ("Service already running") when it is already up.
+     */
+    private fun ensureVoiceEngineRunning() {
+        try {
+            val voiceOn = sosPrefs()
+                .getBoolean("flutter.zelda_voice_guard_enabled", false)
+            if (!voiceOn) return
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            // Own-app services only on API 26+ — exactly what we need here.
+            val running = am.getRunningServices(64).any {
+                it.service.className ==
+                    "id.flutter.flutter_background_service.BackgroundService"
+            }
+            if (running) return
+            Log.i(TAG, "voice engine not running — starting BackgroundService")
+            val intent = Intent(this, BackgroundService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "voice engine start failed: ${e.message}")
+        }
+    }
 
     private fun startCoordinator() {
         if (coordThread != null) return
@@ -213,6 +251,14 @@ class PowerGuardService : Service() {
     private fun tickOnce() {
         val prefs = sosPrefs()
         val now = System.currentTimeMillis()
+
+        // 0. Voice-engine supervisor: if the user enabled voice SOS and the
+        // FMBS BackgroundService is missing (LMK kill, crash, OEM cleanup),
+        // revive it. Idempotent + throttled; pref-gated; plugin dedupes.
+        if (now - lastVoiceCheckMs > 30000) {
+            lastVoiceCheckMs = now
+            ensureVoiceEngineRunning()
+        }
 
         // 1. New alarm request (voice keyword or power 3x while Dart dead).
         val alarmTs = try {

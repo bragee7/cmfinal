@@ -757,39 +757,48 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
   }
 
   Widget _buildVoiceBanner(SosController sos) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        color: AppColors.green900.withValues(alpha: 0.4),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 10,
-            height: 10,
-            decoration: const BoxDecoration(
-              shape: BoxShape.circle,
-              color: AppColors.green500,
-            ),
+    return ValueListenableBuilder<bool>(
+      valueListenable: VoiceGuardService.micDegraded,
+      builder: (context, micDegraded, _) {
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          decoration: BoxDecoration(
+            color: (micDegraded ? Colors.amber.shade900 : AppColors.green900)
+                .withValues(alpha: 0.4),
+            borderRadius: BorderRadius.circular(12),
           ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              sos.voiceEnabled
-                  ? 'Voice Protection Active - Listening for "help me"'
-                  : '24/7 Voice Protection Off',
-              style: const TextStyle(color: AppColors.green400, fontSize: 13),
-            ),
+          child: Row(
+            children: [
+              Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: micDegraded ? Colors.amber : AppColors.green500,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  sos.voiceEnabled
+                      ? (micDegraded
+                          ? 'Voice detection paused - open ZELDA to restore microphone access'
+                          : 'Voice Protection Active - Listening for "help me"')
+                      : '24/7 Voice Protection Off',
+                  style: const TextStyle(
+                      color: AppColors.green400, fontSize: 13),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Switch(
+                value: sos.voiceEnabled,
+                activeThumbColor: AppColors.green500,
+                onChanged: (v) => _toggleVoice(sos, v),
+              ),
+            ],
           ),
-          const SizedBox(width: 8),
-          Switch(
-            value: sos.voiceEnabled,
-            activeThumbColor: AppColors.green500,
-            onChanged: (v) => _toggleVoice(sos, v),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 
