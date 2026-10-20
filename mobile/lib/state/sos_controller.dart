@@ -70,6 +70,9 @@ class SosController extends ChangeNotifier {
   bool _voiceEnabled = false;
   bool _powerSosEnabled = true;
   bool _initialized = false;
+  /// True while a cancellation request is in flight: the cancel UI shows a
+  /// busy state and ignores repeated taps (no duplicate cancel commands).
+  bool _cancelling = false;
 
   SosStatus get status => _status;
   int? get cancelTimer => _cancelTimer;
@@ -91,6 +94,10 @@ class SosController extends ChangeNotifier {
 
   bool get isBusy =>
       _status != SosStatus.idle && _status != SosStatus.listening;
+
+  /// True while a cancellation request is in flight (drives the busy state of
+  /// the shared CancelSosButton; prevents duplicate cancellation requests).
+  bool get isCancelling => _cancelling;
 
   Future<void> init() async {
     if (_initialized) return;
@@ -418,47 +425,62 @@ class SosController extends ChangeNotifier {
   }
 
   Future<void> cancelSOS() async {
-    // Tell the BG executor first (invoke + prefs command: covers open app,
-    // backgrounded app, and the native alarm activity alike). The local
-    // teardown below keeps the open-app UI correct either way.
-    await SosExecutor.requestCancel();
-    if (_mirroring) {
-      // The app was recording on the executor's behalf: report the abort so
-      // the BG chain does not wait out its no-show fallback (its active flag
-      // is already cleared by the cancel above, so this is just a no-op ping
-      // if the cancel already landed).
-      VoiceGuardService.serviceInvoke(
-        SosExecutor.sosAppRecordingDone,
-        {'error': 'cancelled by user'},
-      );
-    }
-    // the recording leaks (camera/mic held, file never finalized). Gated on
-    // recording status so an idle preview/selector controller is untouched.
-    if (_status == SosStatus.recording && _cameraController != null) {
-      try {
-        if (_cameraController!.value.isRecordingVideo) {
-          await _cameraController!.stopVideoRecording();
-        }
-      } catch (_) {}
-      try {
-        await _cameraController?.dispose();
-      } catch (_) {}
-      _cameraController = null;
-      _cameraInitialized = false;
-    }
-    _cancelTimerRef?.cancel();
-    _cancelTimerRef = null;
-    _cancelTimer = null;
-    _countdown = null;
-    _status = SosStatus.listening;
-    _success =
-        'SOS cancelled — voice trigger paused ${SosExecutor.postCancelGraceSeconds}s';
-    VoiceGuardService.resetDetectionCooldown();
+    // Single-flight: a second tap while the first cancellation request is in
+    // flight is ignored (the button is also disabled/busy, this is the
+    // authoritative guard).
+    if (_cancelling) return;
+    _cancelling = true;
     notifyListeners();
-    Future.delayed(const Duration(seconds: 3), () {
-      _success = '';
+    try {
+      // Tell the BG executor first (invoke + prefs command: covers open app,
+      // backgrounded app, and the native alarm activity alike). The local
+      // teardown below keeps the open-app UI correct either way.
+      await SosExecutor.requestCancel().timeout(const Duration(seconds: 5));
+      if (_mirroring) {
+        // The app was recording on the executor's behalf: report the abort so
+        // the BG chain does not wait out its no-show fallback (its active flag
+        // is already cleared by the cancel above, so this is just a no-op ping
+        // if the cancel already landed).
+        VoiceGuardService.serviceInvoke(
+          SosExecutor.sosAppRecordingDone,
+          {'error': 'cancelled by user'},
+        );
+      }
+      // the recording leaks (camera/mic held, file never finalized). Gated on
+      // recording status so an idle preview/selector controller is untouched.
+      if (_status == SosStatus.recording && _cameraController != null) {
+        try {
+          if (_cameraController!.value.isRecordingVideo) {
+            await _cameraController!.stopVideoRecording();
+          }
+        } catch (_) {}
+        try {
+          await _cameraController?.dispose();
+        } catch (_) {}
+        _cameraController = null;
+        _cameraInitialized = false;
+      }
+      _cancelTimerRef?.cancel();
+      _cancelTimerRef = null;
+      _cancelTimer = null;
+      _countdown = null;
+      _status = SosStatus.listening;
+      _success =
+          'SOS cancelled — voice trigger paused ${SosExecutor.postCancelGraceSeconds}s';
+      VoiceGuardService.resetDetectionCooldown();
+      Future.delayed(const Duration(seconds: 3), () {
+        _success = '';
+        notifyListeners();
+      });
+    } catch (_) {
+      // Honest failure: the cancellation workflow did not confirm, so the SOS
+      // state is left untouched (countdown / recording keeps running) and a
+      // retryable error is surfaced instead of a fake success.
+      _error = 'Failed to cancel the SOS. Please try again.';
+    } finally {
+      _cancelling = false;
       notifyListeners();
-    });
+    }
   }
 
   /// Record the 30s evidence clip ON BEHALF of the BG executor (app is open

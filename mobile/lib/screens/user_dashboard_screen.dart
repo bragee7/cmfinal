@@ -19,6 +19,7 @@ import '../services/voice_guard_service.dart';
 import '../state/auth_provider.dart';
 import '../state/contacts_provider.dart';
 import '../state/sos_controller.dart';
+import '../widgets/cancel_sos_button.dart';
 import 'alerts_history_screen.dart';
 
 class UserDashboardScreen extends StatefulWidget {
@@ -594,13 +595,32 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
       ),
       child: Column(
         children: [
+          const Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.sos, color: AppColors.red500, size: 28),
+              SizedBox(width: 10),
+              Text(
+                'SOS Alert Active',
+                style: TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
           const Text(
-            'Zelda Emergency SOS',
-            style: TextStyle(
-              fontSize: 26,
-              fontWeight: FontWeight.w600,
-              color: Colors.white,
-            ),
+            'Your emergency alert has been triggered.',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 15, color: AppColors.gray300),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Emergency assistance will be requested when the countdown ends.',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 14, color: AppColors.gray400),
           ),
           const SizedBox(height: 12),
           const Align(
@@ -649,30 +669,10 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
             style: const TextStyle(fontSize: 15, color: AppColors.gray300),
           ),
           const SizedBox(height: 20),
-          // Prominent, always-visible cancel control — the countdown cannot
-          // be dismissed by gesture or rebuild; only this button cancels.
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton.icon(
-              onPressed: sos.cancelSOS,
-              icon: const Icon(Icons.close, color: Colors.white, size: 28),
-              label: const Text(
-                'Cancel SOS',
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.white,
-                ),
-              ),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.red600,
-                padding: const EdgeInsets.symmetric(vertical: 18),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(40),
-                ),
-              ),
-            ),
-          ),
+          // Prominent, always-visible TAP-to-cancel control — the countdown
+          // cannot be dismissed by gesture or rebuild; only this button
+          // cancels, and it ignores taps while a cancel request is in flight.
+          CancelSosButton(onPressed: sos.cancelSOS, busy: sos.isCancelling),
         ],
       ),
     );
@@ -717,16 +717,10 @@ class _UserDashboardScreenState extends State<UserDashboardScreen>
           // command=cancel in every recording phase (poll, app-report,
           // native-recording) and cancelSOS() stops the camera for the
           // local path, so this is a pure UI addition — no lifecycle change.
-          OutlinedButton.icon(
+          // Same shared tap-to-cancel control as the countdown card.
+          CancelSosButton(
             onPressed: () => sos.cancelSOS(),
-            icon: const Icon(Icons.close, color: AppColors.red500),
-            label: const Text(
-              'Cancel SOS',
-              style: TextStyle(color: AppColors.red500),
-            ),
-            style: OutlinedButton.styleFrom(
-              side: const BorderSide(color: AppColors.red500),
-            ),
+            busy: sos.isCancelling,
           ),
         ],
       ),

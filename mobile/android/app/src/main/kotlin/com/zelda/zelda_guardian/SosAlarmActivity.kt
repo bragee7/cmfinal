@@ -14,9 +14,7 @@ import android.os.Looper
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
-import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -25,7 +23,7 @@ import android.widget.TextView
 /**
  * Full-screen SOS cancel UI shown over the home screen and lock screen.
  * Reference: Android Emergency SOS style — title, live 5..1 countdown in a
- * coral ring, swipe-to-cancel pill at the bottom. The SOS is ALREADY
+ * coral ring, large tap-to-cancel button at the bottom. The SOS is ALREADY
  * triggered: there is no "start" action, only cancel.
  *
  * State is owned by whoever runs the SOS (Dart SosExecutor when alive, else
@@ -69,6 +67,10 @@ class SosAlarmActivity : Activity() {
     // `f}}}` record in the task (the duplicate `auto-dismissing` logs).
     // Display only — SOS state untouched.
     private var windowOver = false
+    // One-shot guard: a second tap while the cancel command is being written
+    // is swallowed, so exactly one cancel request can ever be issued here.
+    private var cancelRequested = false
+    private lateinit var cancelButton: TextView
 
     /** Inactive states tolerated this long before closing. */
     private val INACTIVE_GRACE_MS = 8000L
@@ -163,7 +165,7 @@ class SosAlarmActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         val title = TextView(this).apply {
-            text = "Zelda Emergency SOS"
+            text = "SOS Alert Active"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 30f)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
@@ -177,6 +179,14 @@ class SosAlarmActivity : Activity() {
         titleRow.addView(title)
         titleRow.addView(gear)
         root.addView(titleRow)
+
+        val tagline = TextView(this).apply {
+            text = "Your emergency alert has been triggered."
+            setTextColor(Color.parseColor("#9AA0A6"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setPadding(0, dp(this@SosAlarmActivity, 8), 0, 0)
+        }
+        root.addView(tagline)
 
         val will = TextView(this).apply {
             text = "Your phone will:"
@@ -246,109 +256,50 @@ class SosAlarmActivity : Activity() {
         }
         root.addView(subtitleText)
 
-        // Bottom: cancel pill. The pill NEVER moves under the finger:
-        // pressing must not shift the button. Any release — plain tap or
-        // swipe of any length — cancels via the shared command=cancel path.
-        root.addView(buildCancelPill())
+        // Bottom: large tap-to-cancel button. A single tap cancels via the
+        // shared command=cancel path; repeated taps are swallowed while the
+        // request is in flight (cancelRequested).
+        root.addView(buildCancelButton())
         return root
     }
 
-    private fun buildCancelPill(): View {
-        val h = dp(this@SosAlarmActivity, 76)
-        val pillBg = GradientDrawable().apply {
+    private fun buildCancelButton(): View {
+        val h = dp(this@SosAlarmActivity, 80)
+        val bg = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = h / 2f
-            setColor(Color.parseColor("#2A2A2A"))
+            setColor(Color.parseColor("#C62828"))
         }
-        val pill = FrameLayout(this).apply {
+        cancelButton = TextView(this).apply {
+            text = "CANCEL SOS"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            background = bg
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, h
             )
-            background = pillBg
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Cancel SOS. Activate to cancel the active emergency alert."
+            setOnClickListener { onCancelTapped() }
         }
-        val thumbSize = dp(this@SosAlarmActivity, 60)
-        val thumbBg = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(Color.parseColor("#DADCE0"))
-        }
-        val thumb = TextView(this).apply {
-            text = "\u2715"
-            gravity = Gravity.CENTER
-            setTextColor(Color.parseColor("#7A1F1A"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f)
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            background = thumbBg
-            layoutParams = FrameLayout.LayoutParams(thumbSize, thumbSize).apply {
-                gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                leftMargin = dp(this@SosAlarmActivity, 8)
-            }
-        }
-        val label = TextView(this).apply {
-            text = "Cancel"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 21f)
-            gravity = Gravity.CENTER
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-            // Must NOT be clickable: a clickable full-pill child consumes
-            // DOWN before the pill's touch listener runs, which is exactly
-            // what broke swipe-to-cancel (swipes starting on the label never
-            // moved the thumb; only the tap path survived via click). All
-            // touch is owned by the pill listener below — a plain tap
-            // anywhere on the pill cancels there too.
-            isClickable = false
-            isFocusable = false
-        }
-        pill.addView(label)
-        pill.addView(thumb)
+        return cancelButton
+    }
 
-        // The pill itself is the accessible click target (TalkBack
-        // double-tap → performClick → cancel, independent of touch routing).
-        pill.isClickable = true
-        pill.contentDescription = "Cancel SOS. Activate to cancel the SOS."
-        pill.setOnClickListener { cancelSos() }
-
-        val slop = ViewConfiguration.get(this).scaledTouchSlop
-        var downX = 0f
-        var dragging = false
-        pill.setOnTouchListener { _, ev ->
-            when (ev.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = ev.x
-                    dragging = true
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    // Deliberately NO visual movement: the pill and the X
-                    // thumb stay exactly where they are while pressed.
-                    // A swipe past touch-slop cancels immediately; anything
-                    // shorter cancels on release below. No snap-back needed
-                    // because nothing ever translates.
-                    if (dragging && ev.x - downX > slop) {
-                        dragging = false
-                        cancelSos()
-                    }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    if (dragging) {
-                        dragging = false
-                        // Plain tap, or a swipe that never passed slop:
-                        // both cancel. There is no dead gesture on this pill.
-                        cancelSos()
-                    }
-                    true
-                }
-                MotionEvent.ACTION_CANCEL -> {
-                    dragging = false
-                    true
-                }
-                else -> true
-            }
-        }
-        return pill
+    /**
+     * Single tap cancels — no swipe. After the first tap the button disables
+     * itself and shows CANCELLING… so duplicate taps can never write a second
+     * cancel command.
+     */
+    private fun onCancelTapped() {
+        if (finished || cancelRequested) return
+        cancelRequested = true
+        cancelButton.text = "CANCELLING…"
+        cancelButton.isEnabled = false
+        cancelButton.alpha = 0.7f
+        cancelSos()
     }
 
     // ── state sync ──
