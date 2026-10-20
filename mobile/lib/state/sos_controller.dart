@@ -99,6 +99,53 @@ class SosController extends ChangeNotifier {
   /// the shared CancelSosButton; prevents duplicate cancellation requests).
   bool get isCancelling => _cancelling;
 
+  /// Last session this UI confirmed as cancelled. Snapshots for this id are
+  /// forced to the idle surface even if a late callback/native tick tries to
+  /// restore an active state.
+  String _cancelledSessionId = '';
+
+  /// Releases every mirror/local-flow handle. Called only after a confirmed
+  /// cancellation (or when the authoritative snapshot says the session is
+  /// cancelled) so no timer can re-show the cancel surface.
+  void _releaseMirror() {
+    _mirroring = false;
+    _adoptedNative = false;
+    _cancelTimerRef?.cancel();
+    _cancelTimerRef = null;
+    _recordingTimerRef?.cancel();
+    _recordingTimerRef = null;
+    _cancelTimer = null;
+    _countdown = null;
+  }
+
+  /// Starts the single 5s cancel countdown (also used to re-arm after a
+  /// failed cancellation). Guards every tick against a concurrent cancel so a
+  /// cancelled session can never transition into recording.
+  void _armCancelCountdown(int from) {
+    _cancelTimerRef?.cancel();
+    _cancelTimer = from;
+    _cancelTimerRef = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_cancelling || _status != SosStatus.countdown) {
+        timer.cancel();
+        if (identical(_cancelTimerRef, timer)) _cancelTimerRef = null;
+        return;
+      }
+      _cancelTimer = (_cancelTimer ?? from) - 1;
+      if (_cancelTimer! <= 0) {
+        timer.cancel();
+        _cancelTimerRef = null;
+        _cancelTimer = null;
+        startRecording();
+      }
+      notifyListeners();
+    });
+  }
+
+  /// Test seam: exercises the real snapshot reconciliation without booting
+  /// plugins (geolocator/camera/voice) in a widget test.
+  @visibleForTesting
+  void debugApplySnapshot(Map<String, Object?> snap) => _applySnapshot(snap);
+
   Future<void> init() async {
     if (_initialized) return;
     _initialized = true;
@@ -163,6 +210,15 @@ class SosController extends ChangeNotifier {
     try {
       final snap = await SosExecutor.readSnapshot();
       final raw = (snap['state'] as String?) ?? 'idle';
+      final snapSession = (snap['sessionId'] as String?) ?? '';
+      final snapCancelled = snap['sessionCancelled'] == true ||
+          (snapSession.isNotEmpty && snapSession == _cancelledSessionId);
+      // A cancelled session is never "stale evidence": reconcile it to the
+      // idle surface before the stale-owner gate can adopt/send anything.
+      if (snapCancelled) {
+        _applySnapshot(snap);
+        return;
+      }
       if (raw != 'idle' && raw != 'listening') {
         // Stale-owner gate: the longest real flow is ~60s (5s countdown +
         // 30s record + send), and the native driver renews
@@ -186,6 +242,15 @@ class SosController extends ChangeNotifier {
   /// and sends it once; otherwise clears the stale mirror and unfreezes the
   /// UI without touching live local timers (they own the flow now).
   Future<void> _recoverStaleMirror(Map<String, Object?> snap) async {
+    if (snap['sessionCancelled'] == true) {
+      final snapSession = (snap['sessionId'] as String?) ?? '';
+      if (snapSession.isNotEmpty) _cancelledSessionId = snapSession;
+      _releaseMirror();
+      _status = SosStatus.listening;
+      await SosExecutor.resetMirror();
+      notifyListeners();
+      return;
+    }
     if (_status == SosStatus.sending || _status == SosStatus.sent) return;
     final video = (snap['videoPath'] as String?) ?? '';
     final audio = (snap['audioPath'] as String?) ?? '';
@@ -213,6 +278,36 @@ class SosController extends ChangeNotifier {
     final raw = (snap['state'] as String?) ?? 'idle';
     final mapped = _mapExecutorState(raw);
     final remaining = (snap['remaining'] as int?) ?? 0;
+    final snapSession = (snap['sessionId'] as String?) ?? '';
+
+    // Cancellation fence: a snapshot for a cancelled session can never map
+    // back to an active surface — no matter which callback/timer delivered it.
+    // `sessionCancelled` also covers an in-flight native cancel command.
+    if (snap['sessionCancelled'] == true ||
+        snap['cancelled'] == true ||
+        (snapSession.isNotEmpty && snapSession == _cancelledSessionId)) {
+      if (snapSession.isNotEmpty) _cancelledSessionId = snapSession;
+      final wasActive = _mirroring ||
+          _status == SosStatus.cancelWindow ||
+          _status == SosStatus.countdown ||
+          _status == SosStatus.recording ||
+          _status == SosStatus.sending;
+      _releaseMirror();
+      _status = SosStatus.listening;
+      _error = '';
+      if (snap['cancelled'] == true) {
+        _success = (snap['message'] as String?) ?? 'SOS alert cancelled';
+        VoiceGuardService.resetDetectionCooldown();
+        notifyListeners();
+        Future.delayed(const Duration(seconds: 3), () {
+          _success = '';
+          notifyListeners();
+        });
+        return;
+      }
+      if (wasActive) notifyListeners();
+      return;
+    }
 
     if (raw == 'idle' || raw == 'listening') {
       if (_mirroring) {
@@ -377,6 +472,9 @@ class SosController extends ChangeNotifier {
   }
 
   Future<void> triggerSOS({String? triggerKeyword}) async {
+    // A cancellation in flight owns the lifecycle: no new countdown may start
+    // from a late trigger callback until it settles.
+    if (_cancelling) return;
     // BG executor first: when a BG engine is alive it owns the SOS (same
     // 5s window, works app-closed). The live snapshot renders the UI.
     // Only when NO bg engine runs (voice protection off) does the legacy
@@ -402,26 +500,22 @@ class SosController extends ChangeNotifier {
       return;
     }
 
+    // Local (no-BG) flow still gets a unique session id + clean leftover
+    // state so its cancel fence is exact and pending replays cannot fire.
+    try {
+      await SosExecutor.beginLocalSession();
+      if (_cancelling) return;
+    } catch (_) {}
+
     playAlertSound();
-    _status = SosStatus.countdown;
-    _cancelTimer = 5;
     _error = '';
     _success = '';
+    _status = SosStatus.countdown;
     notifyListeners();
 
     // Single 5s cancel countdown (5→4→3→2→1) straight into recording — one
     // timer, no second phase, nothing that could restart it.
-    _cancelTimerRef?.cancel();
-    _cancelTimerRef = Timer.periodic(const Duration(seconds: 1), (timer) {
-      _cancelTimer = (_cancelTimer ?? 5) - 1;
-      if (_cancelTimer! <= 0) {
-        timer.cancel();
-        _cancelTimerRef = null;
-        _cancelTimer = null;
-        startRecording();
-      }
-      notifyListeners();
-    });
+    _armCancelCountdown(5);
   }
 
   Future<void> cancelSOS() async {
@@ -431,23 +525,53 @@ class SosController extends ChangeNotifier {
     if (_cancelling) return;
     _cancelling = true;
     notifyListeners();
+    String sessionId = '';
     try {
-      // Tell the BG executor first (invoke + prefs command: covers open app,
-      // backgrounded app, and the native alarm activity alike). The local
-      // teardown below keeps the open-app UI correct either way.
-      await SosExecutor.requestCancel().timeout(const Duration(seconds: 5));
+      // Bind the cancellation to the exact session the user is looking at.
+      try {
+        sessionId = await SosExecutor.currentSessionId()
+            .timeout(const Duration(seconds: 5));
+      } catch (_) {}
+
+      // One centralized, idempotent, session-scoped commit. It clears the
+      // persisted mirror, pending triggers, alarm handshake and native
+      // recording command, and tears down the BG executor's timers/tracking.
+      var committed = false;
+      try {
+        committed = await SosExecutor.commitCancellation(
+          reason: 'user cancel',
+          sessionId: sessionId.isEmpty ? null : sessionId,
+        ).timeout(const Duration(seconds: 8));
+      } catch (_) {
+        committed = false;
+      }
+      if (!committed && sessionId.isNotEmpty) {
+        // A concurrent path (native alarm activity / BG poll) may have won
+        // the race. Accept only a persisted fence for THIS session with an
+        // inactive state — never a guess.
+        final snap = await SosExecutor.readSnapshot();
+        final cancelledId = (snap['cancelledSessionId'] as String?) ?? '';
+        final snapState = (snap['state'] as String?) ?? '';
+        if (cancelledId == sessionId &&
+            snapState != 'countdown' &&
+            snapState != 'recording' &&
+            snapState != 'sending') {
+          committed = true;
+        }
+      }
+      if (!committed) {
+        throw StateError('cancellation was not confirmed');
+      }
+
+      // Only now is it safe to tear the UI/processes down.
       if (_mirroring) {
         // The app was recording on the executor's behalf: report the abort so
-        // the BG chain does not wait out its no-show fallback (its active flag
-        // is already cleared by the cancel above, so this is just a no-op ping
-        // if the cancel already landed).
+        // the BG chain does not wait out its no-show fallback.
         VoiceGuardService.serviceInvoke(
           SosExecutor.sosAppRecordingDone,
           {'error': 'cancelled by user'},
         );
       }
-      // the recording leaks (camera/mic held, file never finalized). Gated on
-      // recording status so an idle preview/selector controller is untouched.
       if (_status == SosStatus.recording && _cameraController != null) {
         try {
           if (_cameraController!.value.isRecordingVideo) {
@@ -460,11 +584,11 @@ class SosController extends ChangeNotifier {
         _cameraController = null;
         _cameraInitialized = false;
       }
-      _cancelTimerRef?.cancel();
-      _cancelTimerRef = null;
-      _cancelTimer = null;
-      _countdown = null;
+      stopLocationTracking();
+      _cancelledSessionId = sessionId;
+      _releaseMirror();
       _status = SosStatus.listening;
+      _error = '';
       _success =
           'SOS cancelled — voice trigger paused ${SosExecutor.postCancelGraceSeconds}s';
       VoiceGuardService.resetDetectionCooldown();
@@ -477,6 +601,11 @@ class SosController extends ChangeNotifier {
       // state is left untouched (countdown / recording keeps running) and a
       // retryable error is surfaced instead of a fake success.
       _error = 'Failed to cancel the SOS. Please try again.';
+      // The local countdown may have been consumed while we awaited; re-arm
+      // it so the user still has a live cancel window to retry.
+      if (_status == SosStatus.countdown) {
+        _armCancelCountdown((_cancelTimer ?? 1).clamp(1, 5));
+      }
     } finally {
       _cancelling = false;
       notifyListeners();
@@ -488,6 +617,7 @@ class SosController extends ChangeNotifier {
   /// NOT send: the clip path is reported back and the BG chain continues
   /// (GPS → submit → upload → tracking) without duplicating anything.
   Future<void> recordForExecutor() async {
+    if (_cancelling) return;
     _status = SosStatus.recording;
     _recordingTime = 30;
     notifyListeners();
@@ -543,6 +673,13 @@ class SosController extends ChangeNotifier {
     _cameraInitialized = false;
     _recordedVideoPath = videoPath;
     _showPreview = false; // the BG chain owns the send; no local preview
+    // A cancel may have landed while the 30s clip was recording. Keep the
+    // evidence file but never report/send it for the cancelled session.
+    if (_cancelling || await SosExecutor.isCurrentSessionCancelled()) {
+      _status = SosStatus.listening;
+      notifyListeners();
+      return;
+    }
     try {
       VoiceGuardService.serviceInvoke(
         SosExecutor.sosAppRecordingDone,
@@ -569,6 +706,7 @@ class SosController extends ChangeNotifier {
   }
 
   Future<void> startRecording() async {
+    if (_cancelling || _status == SosStatus.listening) return;
     _status = SosStatus.recording;
     _recordingTime = 30;
     notifyListeners();
@@ -600,6 +738,10 @@ class SosController extends ChangeNotifier {
       final start = DateTime.now();
       _recordingTimerRef?.cancel();
       _recordingTimerRef = Timer.periodic(const Duration(milliseconds: 250), (timer) {
+        if (_cancelling || _status != SosStatus.recording) {
+          timer.cancel();
+          return;
+        }
         final elapsed = DateTime.now().difference(start).inMilliseconds;
         final remaining = ((30000 - elapsed) / 1000).ceil();
         _recordingTime = remaining > 0 ? remaining : 0;
@@ -617,6 +759,7 @@ class SosController extends ChangeNotifier {
   }
 
   Future<void> stopRecordingAndSend() async {
+    if (_cancelling) return;
     _recordingTimerRef?.cancel();
     _recordingTimerRef = null;
 
@@ -635,10 +778,24 @@ class SosController extends ChangeNotifier {
     _recordedVideoPath = videoFile?.path;
     _recordedAudioPath = '';
 
+    if (_cancelling || await SosExecutor.isCurrentSessionCancelled()) {
+      _status = SosStatus.listening;
+      notifyListeners();
+      return;
+    }
     await sendEmergencyData();
   }
 
   Future<void> sendEmergencyData() async {
+    String sessionId = '';
+    try {
+      sessionId = await SosExecutor.currentSessionId();
+    } catch (_) {}
+    if (_cancelling || await _sendSessionCancelled(sessionId)) {
+      _status = SosStatus.listening;
+      notifyListeners();
+      return;
+    }
     _status = SosStatus.sending;
     _error = '';
     notifyListeners();
@@ -648,6 +805,10 @@ class SosController extends ChangeNotifier {
       if (freshLocation != null) {
         _location = freshLocation;
         _locationLink = freshLocation.googleMapsLink;
+      }
+      if (await _sendSessionCancelled(sessionId)) {
+        _abortLocalSend();
+        return;
       }
 
       final videoPath = _recordedVideoPath ?? '';
@@ -663,6 +824,10 @@ class SosController extends ChangeNotifier {
 
       SosCase? caseData;
       try {
+        if (await _sendSessionCancelled(sessionId)) {
+          _abortLocalSend();
+          return;
+        }
         caseData = await _sosService.createCase(
           videoPath: videoPath,
           audioPath: audioPath,
@@ -695,6 +860,13 @@ class SosController extends ChangeNotifier {
         }
       }
 
+      // Cancelled while the POST was in flight: never surface a delivered
+      // case or start tracking for this session.
+      if (await _sendSessionCancelled(sessionId)) {
+        _abortLocalSend();
+        return;
+      }
+
       playAlertSound();
       _status = SosStatus.sent;
       _showPreview = videoPath.isNotEmpty;
@@ -718,16 +890,44 @@ class SosController extends ChangeNotifier {
       VoiceGuardService.resetDetectionCooldown();
 
       Future.delayed(const Duration(seconds: 5), () {
-        _status = SosStatus.listening;
-        _success = '';
-        notifyListeners();
+        if (_status == SosStatus.sent) {
+          _status = SosStatus.listening;
+          _success = '';
+          notifyListeners();
+        }
       });
     } catch (e) {
+      if (await _sendSessionCancelled(sessionId)) {
+        _abortLocalSend();
+        return;
+      }
       _error = 'Failed to send emergency alert. Please check your connection and try again.';
       _status = SosStatus.idle;
       VoiceGuardService.resetDetectionCooldown();
       notifyListeners();
     }
+  }
+
+  /// True when the given local send session no longer owns the flow: either a
+  /// cancel is in flight, the persisted fence names it, or a new session has
+  /// already replaced it.
+  Future<bool> _sendSessionCancelled(String sessionId) async {
+    if (_cancelling) return true;
+    try {
+      if (sessionId.isNotEmpty) {
+        final current = await SosExecutor.currentSessionId();
+        if (current.isNotEmpty && current != sessionId) return true;
+      }
+      return await SosExecutor.isCurrentSessionCancelled();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void _abortLocalSend() {
+    _status = SosStatus.listening;
+    _showPreview = false;
+    notifyListeners();
   }
 
   Future<SosCase?> _verifyCaseDelivered({DateTime? since}) async {

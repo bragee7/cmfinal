@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/api_client.dart';
+import '../state/sos_lifecycle.dart';
 import 'location_service.dart';
 import 'sos_service.dart';
 import 'voice_guard_service.dart';
@@ -46,6 +48,18 @@ class SosExecutor {
   // exit (sent / failed / cancel / fresh trigger / stale reset). Lets boot
   // reconcile distinguish "interrupted mid-send" from idle without auto-send.
   static const sendingAtKey = 'zelda_sos_sending_at';
+
+  // ── session identity + cancellation fence ──
+  // Every trigger (Dart local, BG executor, native claim) stamps a unique
+  // session id. Cancelling writes the cancelled-session fence; any late
+  // snapshot/callback/native tick for that session is then ignored while a
+  // genuinely new SOS (new id) still works normally.
+  static const sessionIdKey = 'zelda_sos_session_id';
+  static const cancelledSessionIdKey = 'zelda_sos_cancelled_session_id';
+  static const cancelledAtKey = 'zelda_sos_cancelled_at';
+  static const cancelReasonKey = 'zelda_sos_cancel_reason';
+  static const pendingVoiceTriggerKey = 'zelda_pending_sos_trigger';
+  static const pendingPowerTriggerKey = 'zelda_power_sos_trigger';
 
   // ── cross-isolate invoke protocol (BG <-> main) ──
   static const sosStateEvent = 'sos_state';
@@ -104,6 +118,12 @@ class SosExecutor {
   static String _source = '';
   static int _busyNotifiedAt = 0;
 
+  static String _newSessionId() {
+    final ms = DateTime.now().millisecondsSinceEpoch;
+    final salt = Random().nextInt(0x7fffffff).toRadixString(16);
+    return 'sos_${ms}_$salt';
+  }
+
   /// Boot the executor inside the BG isolate. Cheap and infallible by
   /// design (prefs + timers only) — call FIRST in _onStart, before any
   /// mic/spotter work, so power-button triggers get a live executor even
@@ -149,6 +169,27 @@ class SosExecutor {
     try {
       final prefs = await SharedPreferences.getInstance()
           .timeout(const Duration(seconds: 5));
+      // Cross-isolate coherency: native cancel/alarm writes may have landed
+      // while this isolate was dead.
+      try {
+        await prefs.reload().timeout(const Duration(seconds: 3));
+      } catch (_) {}
+      final bootState = prefs.getString(stateKey) ?? '';
+      final bootCommand = (prefs.getString(commandKey) ?? '').trim();
+      final bootCancelled = SosLifecycle.isCancelledSession(
+        sessionId: prefs.getString(sessionIdKey),
+        cancelledSessionId: prefs.getString(cancelledSessionIdKey),
+        command: bootCommand,
+        startedAt: prefs.getInt(startedAtKey),
+        cancelledAt: prefs.getInt(cancelledAtKey),
+      );
+      // A cancel that landed right before the isolate died must be committed
+      // before the sending/recording reconcile below can resurrect it.
+      if (bootCommand == 'cancel' ||
+          (bootCancelled && SosLifecycle.isActiveState(bootState))) {
+        await commitCancellation(reason: 'boot reconcile');
+        return;
+      }
       // Sending-phase reconcile (boot during 'sending'): the in-memory loop
       // restarts idle while prefs still says sending. Never auto-send here —
       // reconcile to a safe re-check only. A delivered caseId parks as
@@ -156,7 +197,6 @@ class SosExecutor {
       // gate sees a recent owner instead of an instantly-stale orphan (the
       // existing stale path re-checks evidence after its own timeout).
       try {
-        final bootState = prefs.getString(stateKey) ?? '';
         final sendingMarked =
             prefs.containsKey(sendingAtKey) || bootState == 'sending';
         if (sendingMarked) {
@@ -197,7 +237,37 @@ class SosExecutor {
   /// Safe to call from EITHER isolate: in BG it runs directly; the main
   /// isolate should prefer [requestTrigger] (invoke when BG is alive).
   static Future<void> onTrigger(String source) async {
-    if (_bgService == null) return; // main isolate without BG: caller falls back
+    if (_bgService == null) {
+      return; // main isolate without BG: caller falls back
+    }
+    SharedPreferences prefs;
+    try {
+      prefs = await SharedPreferences.getInstance()
+          .timeout(const Duration(seconds: 5));
+      try {
+        await prefs.reload().timeout(const Duration(seconds: 3));
+      } catch (_) {}
+    } catch (_) {
+      return;
+    }
+    // A cancel that is still in flight wins any trigger race: a stale
+    // pending-trigger replay must never overwrite the cancel fence.
+    final pendingCommand = (prefs.getString(commandKey) ?? '').trim();
+    final pendingState = prefs.getString(stateKey) ?? '';
+    final pendingCancelled = SosLifecycle.isCancelledSession(
+      sessionId: prefs.getString(sessionIdKey),
+      cancelledSessionId: prefs.getString(cancelledSessionIdKey),
+      command: pendingCommand,
+      startedAt: prefs.getInt(startedAtKey),
+      cancelledAt: prefs.getInt(cancelledAtKey),
+    );
+    if (pendingCommand == 'cancel' &&
+        (pendingCancelled || SosLifecycle.isActiveState(pendingState))) {
+      await prefs.setString(commandKey, '');
+      await VoiceGuardService.flog(
+          'sosexec', 'trigger suppressed: cancel already in flight');
+      return;
+    }
     if (_active) {
       final now = DateTime.now().millisecondsSinceEpoch;
       if (now - _busyNotifiedAt > 3000) {
@@ -211,11 +281,12 @@ class SosExecutor {
     _remaining = 5;
     _countdownStartMs = DateTime.now().millisecondsSinceEpoch;
     _source = source;
-    final prefs = await SharedPreferences.getInstance();
+    final sessionId = _newSessionId();
+    await prefs.setString(sessionIdKey, sessionId);
     await prefs.setString(stateKey, _phase);
     await prefs.setInt(remainingKey, _remaining);
     await prefs.setString(sourceKey, _source);
-    await prefs.setInt(startedAtKey, DateTime.now().millisecondsSinceEpoch);
+    await prefs.setInt(startedAtKey, _countdownStartMs);
     await prefs.setString(commandKey, '');
     await prefs.remove(caseIdKey);
     await prefs.remove(videoPathKey);
@@ -224,29 +295,29 @@ class SosExecutor {
     await prefs.setString(nativeCommandKey, '');
     await prefs.remove(nativeDoneKey);
     await prefs.remove(sendingAtKey);
+    // Pending voice/power replays belong to the previous session. Clear
+    // them so they cannot duplicate this fresh trigger.
+    await prefs.remove(pendingVoiceTriggerKey);
+    await prefs.remove(pendingPowerTriggerKey);
+    // A fresh trigger re-arms the native alarm handshake.
+    await prefs.setInt(alarmHandledKey, 0);
     // Native alarm (full-screen cancel UI over home/lock screen). The
     // persistent PowerGuardService polls this key and posts the FSI
     // notification — no platform channel needed from the BG isolate.
     final ts = DateTime.now().millisecondsSinceEpoch;
     await prefs.setInt(alarmRequestKey, ts);
-    await VoiceGuardService.flog('sosexec', 'TRIGGER source=$source');
-    _broadcast();
+    await VoiceGuardService.flog(
+        'sosexec', 'TRIGGER source=$source session=$sessionId');
+    _broadcast(extra: {'sessionId': sessionId});
   }
 
-  /// Cancel the in-flight SOS. Safe from either isolate; the BG loop also
-  /// polls [commandKey] so a native cancel (alarm activity) lands here too.
+  /// Cancel the in-flight SOS. Safe from either isolate: the commit below is
+  /// idempotent and works even when this isolate's `_active` flag was lost
+  /// (BG restart / orphaned mirror), so a cancel can never be a no-op.
   static Future<void> onCancel({bool fromInvoke = false}) async {
-    if (_bgService == null) {
-      // Main isolate with no BG engine: leave a cancel command the BG loop
-      // (or a later boot) will honor, and let the legacy local path finish.
-      try {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString(commandKey, 'cancel');
-      } catch (_) {}
-      return;
-    }
-    if (!_active) return;
-    await _doCancel('user cancel');
+    // `fromInvoke` is kept for call-site compatibility; both paths are the
+    // same user-initiated cancellation.
+    await commitCancellation(reason: 'user cancel');
   }
 
   /// Post-cancel voice grace: new voice fires are suppressed this long after
@@ -260,28 +331,92 @@ class SosExecutor {
   static DateTime? lastUserCancelAt;
 
   static Future<void> _doCancel(String reason) async {
-    // Stamp every user cancel so voice auto-trigger stays quiet for the
-    // grace period; deliberate manual/power triggers stay instant.
-    lastUserCancelAt = DateTime.now();
-    _active = false;
-    _phase = 'listening';
-    _remaining = 0;
+    await commitCancellation(reason: reason);
+  }
+
+  /// Centralized, idempotent, session-scoped cancellation.
+  ///
+  /// Returns true when the session is cancelled (or already was), false when
+  /// the request targets a stale session or persistence failed. Callers must
+  /// NOT report success on false.
+  static Future<bool> commitCancellation({
+    String reason = 'user cancel',
+    String? sessionId,
+  }) async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(stateKey, _phase);
+      final prefs = await SharedPreferences.getInstance()
+          .timeout(const Duration(seconds: 5));
+      try {
+        await prefs.reload().timeout(const Duration(seconds: 3));
+      } catch (_) {}
+
+      var current = (prefs.getString(sessionIdKey) ?? '').trim();
+      final requested = (sessionId ?? '').trim();
+      if (requested.isNotEmpty && current.isEmpty) {
+        // Local flow whose id was not mirrored yet: adopt the caller's id so
+        // the persisted fence and the UI agree.
+        current = requested;
+        await prefs.setString(sessionIdKey, current);
+      }
+      if (requested.isNotEmpty && current.isNotEmpty && requested != current) {
+        await VoiceGuardService.flog('sosexec',
+            'cancel ignored: stale session=$requested current=$current');
+        return false;
+      }
+
+      final cancelledSession =
+          (prefs.getString(cancelledSessionIdKey) ?? '').trim();
+      final state = prefs.getString(stateKey) ?? '';
+      final alreadyCancelled = current.isNotEmpty &&
+          current == cancelledSession &&
+          !SosLifecycle.isActiveState(state);
+      final now = DateTime.now().millisecondsSinceEpoch;
+
+      // Persist the complete cancellation BEFORE tearing down in-memory
+      // ownership. If persistence fails the session stays recoverable and the
+      // caller can retry instead of showing a false success.
+      await prefs.setString(stateKey, 'listening');
       await prefs.setInt(remainingKey, 0);
       await prefs.setString(commandKey, '');
       await prefs.setString(nativeCommandKey, 'stop');
+      // Zero (not remove) so native's `alarmTs > 0` check is false and a
+      // stale `alarm_handled` can never resurrect this session.
+      await prefs.setInt(alarmRequestKey, 0);
+      await prefs.setInt(alarmHandledKey, 0);
       await prefs.remove(sendingAtKey);
-    } catch (_) {}
-    _stopTracking();
-    await VoiceGuardService.flog('sosexec', 'CANCELLED ($reason)');
-    await _resumeMicBestEffort('cancelled');
-    _broadcast(extra: {
-      'cancelled': true,
-      'message':
-          'SOS cancelled — voice trigger paused ${postCancelGraceSeconds}s'
-    });
+      await prefs.remove(nativeDoneKey);
+      await prefs.remove(pendingVoiceTriggerKey);
+      await prefs.remove(pendingPowerTriggerKey);
+      if (current.isNotEmpty) {
+        await prefs.setString(cancelledSessionIdKey, current);
+      }
+      if (!alreadyCancelled) {
+        await prefs.setInt(cancelledAtKey, now);
+        await prefs.setString(cancelReasonKey, reason);
+      }
+
+      // In-memory teardown only runs after the persisted commit.
+      lastUserCancelAt = DateTime.now();
+      _active = false;
+      _phase = 'listening';
+      _remaining = 0;
+      _stopTracking();
+      await VoiceGuardService.flog('sosexec',
+          'CANCELLED ($reason) session=${current.isEmpty ? "(legacy)" : current}');
+      await _resumeMicBestEffort('cancelled');
+      if (!alreadyCancelled) {
+        _broadcast(extra: {
+          'cancelled': true,
+          'message':
+              'SOS cancelled — voice trigger paused ${postCancelGraceSeconds}s',
+          'sessionId': current,
+        });
+      }
+      return true;
+    } catch (e) {
+      await VoiceGuardService.flog('sosexec', 'cancel failed: $e');
+      return false;
+    }
   }
 
   /// 1s heartbeat: power-trigger poll, cancel-command poll, countdown ticks.
@@ -296,25 +431,43 @@ class SosExecutor {
         await prefs.reload().timeout(const Duration(seconds: 3));
       } catch (_) {}
 
+      // Cancel commands are consumed FIRST and even when this isolate's
+      // `_active` flag is false (BG restart / orphaned mirror). This ordering
+      // is the core of the fix: the check previously sat after
+      // `if (!_active) return;`, so a native cancel could never commit.
+      if ((prefs.getString(commandKey) ?? '').trim() == 'cancel') {
+        await commitCancellation(reason: 'alarm-activity cancel');
+        return;
+      }
+
       // Power-button path: native receiver stashed a trigger while we run.
-      final powerTs = prefs.getInt('zelda_power_sos_trigger');
+      final powerTs = prefs.getInt(pendingPowerTriggerKey);
       if (powerTs != null) {
         final age = DateTime.now().millisecondsSinceEpoch - powerTs;
-        await prefs.remove('zelda_power_sos_trigger');
-        if (age >= 0 && age <= 60000) {
+        await prefs.remove(pendingPowerTriggerKey);
+        final cancelledAt = prefs.getInt(cancelledAtKey) ?? 0;
+        final session = (prefs.getString(sessionIdKey) ?? '').trim();
+        final cancelledSession =
+            (prefs.getString(cancelledSessionIdKey) ?? '').trim();
+        // A power press that predates the cancel is a replay, not a new SOS.
+        // A press AFTER the cancel (powerTs > cancelledAt) is deliberate and
+        // must still work.
+        final replayOfCancelled = cancelledAt > 0 &&
+            (session.isEmpty ||
+                (session.isNotEmpty && session == cancelledSession)) &&
+            powerTs <= cancelledAt;
+        if (age >= 0 && age <= 60000 && !replayOfCancelled) {
           await VoiceGuardService.flog('sosexec', 'power trigger polled');
           await onTrigger('power-button');
           return;
         }
+        if (replayOfCancelled) {
+          await VoiceGuardService.flog(
+              'sosexec', 'power trigger replay ignored (cancelled session)');
+        }
       }
 
       if (!_active) return;
-
-      // Native cancel (alarm activity) lands via prefs.
-      if ((prefs.getString(commandKey) ?? '').trim() == 'cancel') {
-        await _doCancel('alarm-activity cancel');
-        return;
-      }
 
       // Live-owner heartbeat: renew startedAt on every tick while owned so
       // the UI stale-owner gate (which expects per-tick renewal) keeps
@@ -472,14 +625,69 @@ class SosExecutor {
     await _sendFromBackground(videoPath: '', audioOnly: true);
   }
 
+  /// Cancel fence for an in-flight background send. True means the session
+  /// was cancelled (or ownership was lost) and the caller must abort without
+  /// writing `sent`, `caseId` or starting location tracking.
+  static Future<bool> _sessionWasCancelled(
+      SharedPreferences? prefsRef, String session) async {
+    if (!_active) return true;
+    try {
+      final prefs = prefsRef ?? await SharedPreferences.getInstance();
+      try {
+        await prefs.reload().timeout(const Duration(seconds: 3));
+      } catch (_) {}
+      if ((prefs.getString(commandKey) ?? '').trim() == 'cancel') return true;
+      final cancelledSession =
+          (prefs.getString(cancelledSessionIdKey) ?? '').trim();
+      if (session.isNotEmpty) return cancelledSession == session;
+      return SosLifecycle.isCancelledSession(
+        command: prefs.getString(commandKey),
+        startedAt: prefs.getInt(startedAtKey),
+        cancelledAt: prefs.getInt(cancelledAtKey),
+      );
+    } catch (_) {
+      // Never abort a genuine emergency send because prefs hiccuped.
+      return false;
+    }
+  }
+
+  static Future<void> _abortCancelledSend(
+      SharedPreferences? prefsRef, String session) async {
+    _active = false;
+    _phase = 'listening';
+    _remaining = 0;
+    try {
+      final prefs = prefsRef ?? await SharedPreferences.getInstance();
+      await prefs.setString(stateKey, 'listening');
+      await prefs.setInt(remainingKey, 0);
+      await prefs.remove(sendingAtKey);
+    } catch (_) {}
+    await VoiceGuardService.flog('sosexec',
+        'send aborted — session cancelled session=${session.isEmpty ? "(legacy)" : session}');
+    await _resumeMicBestEffort('send-cancelled');
+  }
+
   static Future<void> _sendFromBackground({
     required String videoPath,
     required bool audioOnly,
   }) async {
     if (!_active) return;
+    SharedPreferences? prefsRef;
+    var session = '';
+    try {
+      prefsRef = await SharedPreferences.getInstance();
+      try {
+        await prefsRef.reload().timeout(const Duration(seconds: 3));
+      } catch (_) {}
+      session = (prefsRef.getString(sessionIdKey) ?? '').trim();
+    } catch (_) {}
+    if (await _sessionWasCancelled(prefsRef, session)) {
+      await _abortCancelledSend(prefsRef, session);
+      return;
+    }
     _phase = 'sending';
     try {
-      final prefs = await SharedPreferences.getInstance();
+      final prefs = prefsRef ?? await SharedPreferences.getInstance();
       await prefs.setString(stateKey, _phase);
       await prefs.setInt(sendingAtKey, DateTime.now().millisecondsSinceEpoch);
     } catch (_) {}
@@ -498,6 +706,11 @@ class SosExecutor {
       }
     } catch (e) {
       await VoiceGuardService.flog('sosexec', 'BG location failed: $e');
+    }
+
+    if (await _sessionWasCancelled(prefsRef, session)) {
+      await _abortCancelledSend(prefsRef, session);
+      return;
     }
 
     try {
@@ -531,6 +744,15 @@ class SosExecutor {
             notes: 'SOS Alert ($_source) at ${DateTime.now().toLocal()}',
           )
           .timeout(const Duration(minutes: 3));
+      // Cancel may have landed while the POST was in flight. Do not mirror
+      // `sent`/caseId or start tracking for a cancelled session (the server
+      // may still have created the case — documented limitation).
+      if (await _sessionWasCancelled(prefsRef, session)) {
+        await VoiceGuardService.flog('sosexec',
+            'POST completed after cancel — case=${caseData.id} not adopted');
+        await _abortCancelledSend(prefsRef, session);
+        return;
+      }
       _phase = 'sent';
       try {
         final prefs = await SharedPreferences.getInstance();
@@ -552,13 +774,20 @@ class SosExecutor {
       } catch (_) {}
       await _resumeMicBestEffort('sent');
     } catch (e) {
+      final cancelledNow = await _sessionWasCancelled(prefsRef, session);
       _active = false;
-      _phase = 'idle';
+      _phase = cancelledNow ? 'listening' : 'idle';
       try {
-        final prefs = await SharedPreferences.getInstance();
+        final prefs = prefsRef ?? await SharedPreferences.getInstance();
         await prefs.setString(stateKey, _phase);
         await prefs.remove(sendingAtKey);
       } catch (_) {}
+      if (cancelledNow) {
+        await VoiceGuardService.flog(
+            'sosexec', 'send aborted after cancel: $e');
+        await _resumeMicBestEffort('send-cancelled');
+        return;
+      }
       await VoiceGuardService.flog('sosexec', 'SEND FAILED: $e');
       await _resumeMicBestEffort('send-failed');
       _broadcast(extra: {
@@ -625,18 +854,21 @@ class SosExecutor {
     }
   }
 
-  /// Ask the BG executor to cancel (invoke + prefs command belt & braces).
-  static Future<void> requestCancel() async {
+  /// Ask the BG executor to cancel (invoke + authoritative prefs commit).
+  /// Returns false when the caller's session is stale or persistence failed;
+  /// callers must surface that instead of a false success.
+  static Future<bool> requestCancel({String? sessionId}) async {
+    final committed =
+        await commitCancellation(reason: 'user cancel', sessionId: sessionId);
+    if (!committed) return false;
     try {
+      if (_bgService != null) {
+        // Same isolate (BG): commit already ran, no round-trip needed.
+        return true;
+      }
       VoiceGuardService.serviceInvoke(sosCancelInvoke);
     } catch (_) {}
-    try {
-      final prefs = await SharedPreferences.getInstance()
-          .timeout(const Duration(seconds: 5));
-      await prefs
-          .setString(commandKey, 'cancel')
-          .timeout(const Duration(seconds: 5));
-    } catch (_) {}
+    return true;
   }
 
   /// Ask the native layer to post the full-screen SOS alarm
@@ -664,20 +896,46 @@ class SosExecutor {
       try {
         await prefs.reload().timeout(const Duration(seconds: 5));
       } catch (_) {}
+      final state = prefs.getString(stateKey) ?? 'idle';
+      final command = prefs.getString(commandKey) ?? '';
+      final sessionId = (prefs.getString(sessionIdKey) ?? '').trim();
+      final cancelledSessionId =
+          (prefs.getString(cancelledSessionIdKey) ?? '').trim();
+      final startedAt = prefs.getInt(startedAtKey) ?? 0;
+      final cancelledAt = prefs.getInt(cancelledAtKey) ?? 0;
+      final sessionCancelled = command.trim() == 'cancel' ||
+          SosLifecycle.isCancelledSession(
+            sessionId: sessionId,
+            cancelledSessionId: cancelledSessionId,
+            command: command,
+            startedAt: startedAt,
+            cancelledAt: cancelledAt,
+          );
       return {
-        'state': prefs.getString(stateKey) ?? 'idle',
+        'state': state,
         'remaining': prefs.getInt(remainingKey) ?? 0,
         'source': prefs.getString(sourceKey) ?? '',
         'caseId': prefs.getString(caseIdKey) ?? '',
-      'videoPath': prefs.getString(videoPathKey) ?? '',
-      'audioPath': prefs.getString(audioPathKey) ?? '',
-      'audioOnly': prefs.getBool(audioOnlyKey) ?? false,
-      'nativeDone': prefs.containsKey(nativeDoneKey),
-      'command': prefs.getString(commandKey) ?? '',
-      'startedAt': prefs.getInt(startedAtKey) ?? 0,
-    };
+        'videoPath': prefs.getString(videoPathKey) ?? '',
+        'audioPath': prefs.getString(audioPathKey) ?? '',
+        'audioOnly': prefs.getBool(audioOnlyKey) ?? false,
+        'nativeDone': prefs.containsKey(nativeDoneKey),
+        'command': command,
+        'startedAt': startedAt,
+        'sessionId': sessionId,
+        'sessionCancelled': sessionCancelled,
+        'cancelledSessionId': cancelledSessionId,
+        'cancelledAt': cancelledAt,
+        'cancelReason': prefs.getString(cancelReasonKey) ?? '',
+      };
     } catch (_) {
-      return {'state': 'idle', 'remaining': 0, 'source': '', 'caseId': ''};
+      return {
+        'state': 'idle',
+        'remaining': 0,
+        'source': '',
+        'caseId': '',
+        'sessionCancelled': false,
+      };
     }
   }
 
@@ -693,6 +951,62 @@ class SosExecutor {
       await prefs.remove(commandKey);
       await prefs.remove(nativeDoneKey);
       await prefs.remove(sendingAtKey);
+      await prefs.setString(nativeCommandKey, '');
+      await prefs.remove(pendingVoiceTriggerKey);
+      await prefs.remove(pendingPowerTriggerKey);
+      await prefs.setInt(alarmRequestKey, 0);
+      await prefs.setInt(alarmHandledKey, 0);
     } catch (_) {}
+  }
+
+  /// Current session id, or '' for legacy snapshots.
+  static Future<String> currentSessionId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance()
+          .timeout(const Duration(seconds: 5));
+      try {
+        await prefs.reload().timeout(const Duration(seconds: 3));
+      } catch (_) {}
+      return (prefs.getString(sessionIdKey) ?? '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// Start a main-isolate (no BG engine) session: stamps a fresh id and
+  /// clears anything left over from the previous session WITHOUT writing an
+  /// active state (the caller owns the local countdown).
+  static Future<String> beginLocalSession() async {
+    final prefs = await SharedPreferences.getInstance()
+        .timeout(const Duration(seconds: 5));
+    final id = _newSessionId();
+    await prefs.setString(sessionIdKey, id);
+    await prefs.setString(commandKey, '');
+    await prefs.remove(pendingVoiceTriggerKey);
+    await prefs.remove(pendingPowerTriggerKey);
+    await prefs.remove(nativeDoneKey);
+    await prefs.remove(sendingAtKey);
+    await prefs.setInt(alarmHandledKey, 0);
+    return id;
+  }
+
+  /// Fence check used by the UI/controller before sending anything.
+  static Future<bool> isCurrentSessionCancelled() async {
+    try {
+      final prefs = await SharedPreferences.getInstance()
+          .timeout(const Duration(seconds: 5));
+      try {
+        await prefs.reload().timeout(const Duration(seconds: 3));
+      } catch (_) {}
+      return SosLifecycle.isCancelledSession(
+        sessionId: prefs.getString(sessionIdKey),
+        cancelledSessionId: prefs.getString(cancelledSessionIdKey),
+        command: prefs.getString(commandKey),
+        startedAt: prefs.getInt(startedAtKey),
+        cancelledAt: prefs.getInt(cancelledAtKey),
+      );
+    } catch (_) {
+      return false;
+    }
   }
 }

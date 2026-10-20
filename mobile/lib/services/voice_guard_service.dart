@@ -137,7 +137,11 @@ class VoiceGuardService {
   /// Best-effort: even if this cross-isolate event is ever lost, the short
   /// [_dedupeWindow] self-heals within a few seconds.
   static void resetDetectionCooldown() {
-    _service.invoke(_resetCooldownEvent);
+    // Best-effort: in plain unit/widget tests (and before the BG service is
+    // bound) this invoke has no receiver and must not crash callers.
+    try {
+      _service.invoke(_resetCooldownEvent);
+    } catch (_) {}
   }
 
   /// Record that a trigger word was detected by the background isolate so
@@ -165,6 +169,23 @@ class VoiceGuardService {
     await _clearPendingTrigger();
     final age = DateTime.now().millisecondsSinceEpoch - ts;
     if (age < 0 || age > 60000) return false; // stale
+    // Never replay a trigger that predates the last confirmed cancellation of
+    // this session: it would start a brand-new countdown after the user
+    // already cancelled (the duplicate cancel-screen bug).
+    final cancelledAt = prefs.getInt(SosExecutor.cancelledAtKey) ?? 0;
+    final session = (prefs.getString(SosExecutor.sessionIdKey) ?? '').trim();
+    final cancelledSession =
+        (prefs.getString(SosExecutor.cancelledSessionIdKey) ?? '').trim();
+    final replayOfCancelled = cancelledAt > 0 &&
+        (session.isEmpty || session == cancelledSession) &&
+        ts <= cancelledAt;
+    if (replayOfCancelled) {
+      await VoiceGuardService.flog(
+        'bg',
+        'pending voice trigger ignored (cancelled session)',
+      );
+      return false;
+    }
     developer.log(
       'Firing pending SOS trigger from background',
       name: 'VoiceGuard',
@@ -1099,9 +1120,22 @@ Future<void> _onStart(ServiceInstance service) async {
       // ("did it cancel?", TV dialogue, testing chatter) must not instantly
       // re-fire a new SOS — that loop feels exactly like "cancel doesn't
       // work". Manual/power triggers bypass this (checked only here).
-      final cancelAge = SosExecutor.lastUserCancelAt == null
+      // The static timestamp covers this isolate; the persisted cancelled_at
+      // covers native/BG-restart cancels where that static is lost.
+      var cancelAge = SosExecutor.lastUserCancelAt == null
           ? null
           : now.difference(SosExecutor.lastUserCancelAt!);
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final persisted = prefs.getInt(SosExecutor.cancelledAtKey) ?? 0;
+        if (persisted > 0) {
+          final persistedAge = now.difference(
+              DateTime.fromMillisecondsSinceEpoch(persisted));
+          if (cancelAge == null || persistedAge < cancelAge) {
+            cancelAge = persistedAge;
+          }
+        }
+      } catch (_) {}
       if (cancelAge != null && cancelAge < SosExecutor.postCancelVoiceGrace) {
         final remaining = SosExecutor.postCancelVoiceGrace.inSeconds -
             cancelAge.inSeconds;

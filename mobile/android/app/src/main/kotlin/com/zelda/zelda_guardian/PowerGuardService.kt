@@ -31,7 +31,7 @@ class PowerGuardService : Service() {
         private const val CHANNEL_ID = "zelda_power_guard"
         private const val NOTIF_ID = 258
         const val ACTION_TRIGGER = "com.zelda.zelda_guardian.POWER_SOS_TRIGGER"
-        private const val ALARM_NOTIF_ID = 259
+        const val ALARM_NOTIF_ID = 259
         // Heads-up/lock-screen Cancel button action. Writes the IDENTICAL
         // command the SosAlarmActivity Cancel pill writes; honored through
         // the shared cancel path. Display plumbing only.
@@ -82,18 +82,18 @@ class PowerGuardService : Service() {
         return START_STICKY
     }
 
-    // Lock-screen / heads-up Cancel button. Writes the IDENTICAL command
-    // the SosAlarmActivity Cancel pill writes
-    // (FlutterSharedPreferences flutter.zelda_sos_command = "cancel"), so the
-    // Dart executor poll and native driveFlow honor it through the shared
-    // cancel path. Also withdraws the alarm notification. Display plumbing
-    // only — SOS state machine untouched.
+    // Lock-screen / heads-up Cancel button. Commits the SAME authoritative
+    // cancellation as the SosAlarmActivity button: state + session fence +
+    // pending triggers + native recording, idempotently. Also withdraws the
+    // alarm notification.
     private fun handleAlarmCancel() {
         try {
-            sosPrefs().edit().putString("flutter.zelda_sos_command", "cancel").apply()
-            Log.i(TAG, "alarm Cancel action tapped — wrote command=cancel")
+            SosSessionStore.commitCancel(this, "notification-action")
+            nativeActive = false
+            pendingAlarmTs = 0L
+            Log.i(TAG, "alarm Cancel action tapped — cancellation committed")
         } catch (e: Exception) {
-            Log.w(TAG, "alarm cancel write failed: ${e.message}")
+            Log.w(TAG, "alarm cancel commit failed: ${e.message}")
         }
         try {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
@@ -252,6 +252,20 @@ class PowerGuardService : Service() {
         val prefs = sosPrefs()
         val now = System.currentTimeMillis()
 
+        // Cancellation is authoritative and is consumed before anything else:
+        // a cancel command left by the alarm activity/notification must commit
+        // even when no Dart executor is alive to process it.
+        val command = try {
+            prefs.getString(SosSessionStore.COMMAND, "")?.trim() ?: ""
+        } catch (_: Exception) { "" }
+        if (command == "cancel") {
+            SosSessionStore.commitCancel(this, "coordinator cancel")
+            nativeActive = false
+            pendingAlarmTs = 0L
+            return
+        }
+        val cancelled = SosSessionStore.isSessionCancelled(prefs)
+
         // 0. Voice-engine supervisor: if the user enabled voice SOS and the
         // FMBS BackgroundService is missing (LMK kill, crash, OEM cleanup),
         // revive it. Idempotent + throttled; pref-gated; plugin dedupes.
@@ -262,30 +276,39 @@ class PowerGuardService : Service() {
 
         // 1. New alarm request (voice keyword or power 3x while Dart dead).
         val alarmTs = try {
-            prefs.getLong("flutter.zelda_sos_alarm_request", 0)
+            prefs.getLong(SosSessionStore.ALARM_REQUEST, 0)
         } catch (_: Exception) { 0 }
         val handled = try {
-            prefs.getLong("flutter.zelda_sos_alarm_handled", 0)
+            prefs.getLong(SosSessionStore.ALARM_HANDLED, 0)
         } catch (_: Exception) { 0 }
-        if (alarmTs > 0 && alarmTs != handled && now - alarmTs < 60000) {
+        if (!cancelled && alarmTs > handled && now - alarmTs < 60000) {
             try {
-                prefs.edit().putLong("flutter.zelda_sos_alarm_handled", alarmTs).apply()
+                prefs.edit().putLong(SosSessionStore.ALARM_HANDLED, alarmTs).apply()
             } catch (_: Exception) {}
             pendingAlarmTs = alarmTs
             if (!isAppForeground()) launchAlarmUi()
         }
 
         val state = try {
-            prefs.getString("flutter.zelda_sos_state", "") ?: ""
+            prefs.getString(SosSessionStore.STATE, "") ?: ""
         } catch (_: Exception) { "" }
         val startedAt = try {
-            prefs.getLong("flutter.zelda_sos_started_at", 0)
+            prefs.getLong(SosSessionStore.STARTED_AT, 0)
         } catch (_: Exception) { 0 }
         val dartOwns = state in setOf("cancelWindow", "countdown", "recording", "sending") &&
             now - startedAt < 180000
 
+        // A cancelled session with a still-active mirror is stale by
+        // definition: reconcile it to listening and never re-present the UI.
+        if (cancelled && SosSessionStore.isActiveState(state)) {
+            SosSessionStore.commitCancel(this, "coordinator reconcile")
+            nativeActive = false
+            pendingAlarmTs = 0L
+            return
+        }
+
         // 2. Dart-owned flow asking for native recording (app-recording no-show).
-        if (!nativeActive) {
+        if (!nativeActive && !cancelled) {
             val cmd = try {
                 prefs.getString("flutter.zelda_sos_native_command", "") ?: ""
             } catch (_: Exception) { "" }
@@ -309,14 +332,22 @@ class PowerGuardService : Service() {
             // race: the Activity dismisses itself once recording starts, and
             // the window-states gate below prevents any relaunch loop.
             // Pure display — SOS state untouched.
-            if (state in setOf("cancelWindow", "countdown") &&
+            if (!cancelled && state in setOf("cancelWindow", "countdown") &&
                 !SosAlarmActivity.isShowing && !isAppForeground()) launchAlarmUi()
             return
         }
 
         // 4. Claim a native-owned flow after the grace window (Dart never came).
         if (!nativeActive && !dartOwns) {
-            if (pendingAlarmTs > 0 && now - pendingAlarmTs > 3000 &&
+            val cancelledAt = try {
+                prefs.getLong(SosSessionStore.CANCELLED_AT, 0L)
+            } catch (_: Exception) { 0L }
+            // A pending press that predates the cancel is a replay, not a new
+            // SOS; a press AFTER the cancel is deliberate and still claims.
+            val replay = cancelled && pendingAlarmTs > 0 && pendingAlarmTs <= cancelledAt
+            if (replay) {
+                pendingAlarmTs = 0L
+            } else if (pendingAlarmTs > 0 && now - pendingAlarmTs > 3000 &&
                 now - pendingAlarmTs < 60000 && !isAppForeground()
             ) {
                 claimNativeFlow(prefs)
@@ -326,8 +357,14 @@ class PowerGuardService : Service() {
             return
         }
 
-        // 5. Drive the native-owned flow.
-        if (nativeActive) driveNativeFlow(prefs, now)
+        // 5. Drive the native-owned flow (or shut it down if cancelled).
+        if (nativeActive) {
+            if (cancelled) {
+                cancelNativeFlow(prefs, "cancelled session")
+            } else {
+                driveNativeFlow(prefs, now)
+            }
+        }
     }
 
     private fun isAppForeground(): Boolean {
@@ -340,6 +377,16 @@ class PowerGuardService : Service() {
     }
 
     private fun launchAlarmUi() {
+        // Cancellation fence: never present the alert for a cancelled session,
+        // even if a stale tick/FSI post is still in flight.
+        val guardPrefs = sosPrefs()
+        val guardCommand = try {
+            guardPrefs.getString(SosSessionStore.COMMAND, "")?.trim() ?: ""
+        } catch (_: Exception) { "" }
+        if (guardCommand == "cancel" || SosSessionStore.isSessionCancelled(guardPrefs)) {
+            Log.i(TAG, "alarm UI suppressed (session cancelled)")
+            return
+        }
         // Launch debounce: the 500 ms coordinator can tick twice before the
         // launched Activity's onCreate sets isShowing=true (~200-500 ms
         // inflation). Without this, tick N launches task A and tick N+1 sees
@@ -411,11 +458,17 @@ class PowerGuardService : Service() {
         // background-activity-start exemption this needs. Display only.
         coordHandler?.postDelayed({
             try {
+                val p = sosPrefs()
                 val st = try {
-                    sosPrefs().getString("flutter.zelda_sos_state", "") ?: ""
+                    p.getString(SosSessionStore.STATE, "") ?: ""
+                } catch (_: Exception) { "" }
+                val cmd = try {
+                    p.getString(SosSessionStore.COMMAND, "")?.trim() ?: ""
                 } catch (_: Exception) { "" }
                 if (!SosAlarmActivity.isShowing &&
-                    (st == "cancelWindow" || st == "countdown")
+                    (st == "cancelWindow" || st == "countdown") &&
+                    cmd != "cancel" &&
+                    !SosSessionStore.isSessionCancelled(p)
                 ) {
                     try {
                         val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
@@ -436,6 +489,14 @@ class PowerGuardService : Service() {
     }
 
     private fun claimNativeFlow(prefs: android.content.SharedPreferences) {
+        // A cancel that arrived before the claim always wins.
+        val claimCommand = try {
+            prefs.getString(SosSessionStore.COMMAND, "")?.trim() ?: ""
+        } catch (_: Exception) { "" }
+        if (claimCommand == "cancel") {
+            Log.i(TAG, "native claim suppressed (cancel)")
+            return
+        }
         // Re-check under the same rules (avoid double-claim with Dart).
         val now = System.currentTimeMillis()
         val state = try {
@@ -469,6 +530,11 @@ class PowerGuardService : Service() {
                 .remove("flutter.zelda_sos_audio_path")
                 .putBoolean("flutter.zelda_sos_audio_only", false)
                 .remove("flutter.zelda_sos_native_done")
+                .putString(SosSessionStore.SESSION_ID, SosSessionStore.newSessionId())
+                .putString(SosSessionStore.NATIVE_COMMAND, "")
+                .putLong(SosSessionStore.ALARM_HANDLED, 0L)
+                .remove(SosSessionStore.PENDING_VOICE)
+                .remove(SosSessionStore.PENDING_POWER)
                 .apply()
         } catch (_: Exception) {}
         Log.i(TAG, "native SOS flow claimed (Dart dead)")
@@ -482,6 +548,11 @@ class PowerGuardService : Service() {
         } catch (_: Exception) { "" }
         if (cmd.trim() == "cancel") {
             cancelNativeFlow(prefs, "alarm-activity cancel")
+            return
+        }
+        // A persisted cancellation fence (native or Dart) always wins.
+        if (SosSessionStore.isSessionCancelled(prefs)) {
+            cancelNativeFlow(prefs, "cancelled session")
             return
         }
         // A live Dart executor re-claiming mid-flow: stand down, it owns send.
@@ -538,16 +609,11 @@ class PowerGuardService : Service() {
 
     private fun cancelNativeFlow(prefs: android.content.SharedPreferences, reason: String) {
         nativeActive = false
-        try {
-            prefs.edit()
-                .putString("flutter.zelda_sos_state", "listening")
-                .putInt("flutter.zelda_sos_remaining", 0)
-                .putString("flutter.zelda_sos_command", "")
-                .putString("flutter.zelda_sos_native_command", "stop")
-                .apply()
-        } catch (_: Exception) {}
-        SosRecordingService.stop(this)
-        Log.i(TAG, "native SOS CANCELLED ($reason)")
+        // Centralized native commit: clears the mirror, pending triggers,
+        // alarm handshake and recorder, and stamps the session fence so no
+        // tick can relaunch the alert for this session.
+        SosSessionStore.commitCancel(this, reason)
+        Log.i(TAG, "native SOS CANCELLED ($reason) session=${SosSessionStore.currentSession(prefs)}")
     }
 
     private fun createChannel() {

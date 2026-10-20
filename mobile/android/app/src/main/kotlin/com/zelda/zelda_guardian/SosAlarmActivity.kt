@@ -2,6 +2,7 @@ package com.zelda.zelda_guardian
 
 import android.app.Activity
 import android.app.KeyguardManager
+import android.app.NotificationManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
@@ -305,6 +306,13 @@ class SosAlarmActivity : Activity() {
     // ── state sync ──
 
     private fun refresh() {
+        // A confirmed cancellation is terminal for this activity, even if a
+        // stale FSI/refresh callback tries to keep the alert on screen.
+        if (SosSessionStore.isSessionCancelled(prefs)) {
+            isShowing = false
+            finish()
+            return
+        }
         val state = try {
             prefs.getString(STATE, "idle") ?: "idle"
         } catch (_: Exception) { "idle" }
@@ -360,8 +368,13 @@ class SosAlarmActivity : Activity() {
 
     private fun cancelSos() {
         if (finished) return
+        // Same centralized native commit the coordinator/notification use:
+        // clears the mirror, pending triggers, alarm handshake and recorder,
+        // and stamps the session fence so nothing can relaunch this alert.
+        SosSessionStore.commitCancel(this, "alarm-activity")
         try {
-            prefs.edit().putString(COMMAND, "cancel").apply()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(PowerGuardService.ALARM_NOTIF_ID)
         } catch (_: Exception) {}
         finish()
     }
