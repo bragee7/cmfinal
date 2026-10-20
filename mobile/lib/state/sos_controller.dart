@@ -538,8 +538,11 @@ class SosController extends ChangeNotifier {
       // recording command, and tears down the BG executor's timers/tracking.
       var committed = false;
       try {
-        committed = await SosExecutor.commitCancellation(
-          reason: 'user cancel',
+        // requestCancel performs the same idempotent commit AND wakes the BG
+        // isolate's in-memory teardown (onCancel → commitCancellation). Without
+        // the invoke, a live BG executor keeps its own _active flag and keeps
+        // broadcasting the old recording state after the prefs were cleared.
+        committed = await SosExecutor.requestCancel(
           sessionId: sessionId.isEmpty ? null : sessionId,
         ).timeout(const Duration(seconds: 8));
       } catch (_) {
@@ -563,15 +566,10 @@ class SosController extends ChangeNotifier {
         throw StateError('cancellation was not confirmed');
       }
 
-      // Only now is it safe to tear the UI/processes down.
-      if (_mirroring) {
-        // The app was recording on the executor's behalf: report the abort so
-        // the BG chain does not wait out its no-show fallback.
-        VoiceGuardService.serviceInvoke(
-          SosExecutor.sosAppRecordingDone,
-          {'error': 'cancelled by user'},
-        );
-      }
+      // Only now is it safe to tear the UI/processes down. The camera stop
+      // below aborts any in-app recording; do NOT send an app-recording error
+      // report here — with the BG still alive it would fall through to
+      // _beginNativeRecording and restart the recorder after the cancel.
       if (_status == SosStatus.recording && _cameraController != null) {
         try {
           if (_cameraController!.value.isRecordingVideo) {

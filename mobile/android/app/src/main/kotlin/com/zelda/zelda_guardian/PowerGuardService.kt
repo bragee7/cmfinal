@@ -281,7 +281,14 @@ class PowerGuardService : Service() {
         val handled = try {
             prefs.getLong(SosSessionStore.ALARM_HANDLED, 0)
         } catch (_: Exception) { 0 }
-        if (!cancelled && alarmTs > handled && now - alarmTs < 60000) {
+        val cancelledAt = try {
+            prefs.getLong(SosSessionStore.CANCELLED_AT, 0L)
+        } catch (_: Exception) { 0L }
+        // A new press/voice alarm after a cancel (ts > cancelled_at) is a
+        // genuinely NEW request and must still fire; only requests that
+        // predate the cancel are replays of the cancelled session.
+        val alarmReplay = cancelled && alarmTs > 0 && alarmTs <= cancelledAt
+        if (!alarmReplay && alarmTs > handled && now - alarmTs < 60000) {
             try {
                 prefs.edit().putLong(SosSessionStore.ALARM_HANDLED, alarmTs).apply()
             } catch (_: Exception) {}

@@ -116,6 +116,9 @@ class SosExecutor {
   /// where the shared 1s poll tick happens to fall.
   static int _countdownStartMs = 0;
   static String _source = '';
+  /// Session id owned by this BG isolate, mirrored on every broadcast so the
+  /// UI can fence late snapshots even before the next disk poll.
+  static String _activeSessionId = '';
   static int _busyNotifiedAt = 0;
 
   static String _newSessionId() {
@@ -223,6 +226,7 @@ class SosExecutor {
       _phase = 'recording';
       _remaining = 0;
       _source = prefs.getString(sourceKey) ?? '';
+      _activeSessionId = prefs.getString(sessionIdKey) ?? '';
       final video = prefs.getString(videoPathKey) ?? '';
       final audioOnly = prefs.getBool(audioOnlyKey) ?? false;
       await VoiceGuardService.flog(
@@ -282,6 +286,7 @@ class SosExecutor {
     _countdownStartMs = DateTime.now().millisecondsSinceEpoch;
     _source = source;
     final sessionId = _newSessionId();
+    _activeSessionId = sessionId;
     await prefs.setString(sessionIdKey, sessionId);
     await prefs.setString(stateKey, _phase);
     await prefs.setInt(remainingKey, _remaining);
@@ -401,6 +406,7 @@ class SosExecutor {
       _phase = 'listening';
       _remaining = 0;
       _stopTracking();
+      _activeSessionId = '';
       await VoiceGuardService.flog('sosexec',
           'CANCELLED ($reason) session=${current.isEmpty ? "(legacy)" : current}');
       await _resumeMicBestEffort('cancelled');
@@ -830,6 +836,7 @@ class SosExecutor {
       'remaining': _remaining,
       'source': _source,
       'active': _active,
+      'sessionId': _activeSessionId,
     };
     if (extra != null) payload.addAll(extra);
     try {
